@@ -17,6 +17,7 @@ import yt_dlp
 from pydub import AudioSegment
 import assemblyai as aai
 import math
+import shutil
 
 from dotenv import load_dotenv
 load_dotenv()  # This will load the .env file
@@ -86,18 +87,27 @@ def extract_video_id(url: str) -> str:
 def get_video_info_and_audio(url: str) -> tuple[str, str, float]:
     """Download video info and extract audio file"""
     try:
+        # Create a unique temporary directory for this download
+        temp_dir = tempfile.mkdtemp(prefix="yt_audio_")
+        safe_filename = f"audio_{uuid.uuid4().hex[:8]}"
+        
         # Configure yt-dlp for audio extraction
         ydl_opts = {
-            'format': 'bestaudio/best',
-            'extractaudio': True,
-            'audioformat': 'mp3',
-            'audioquality': '128',  # Good balance of quality/size
-            'outtmpl': tempfile.gettempdir() + '/%(title)s.%(ext)s',
+            'format': 'bestaudio[ext=mp3]/bestaudio/best',
+            'outtmpl': os.path.join(temp_dir, f'{safe_filename}.%(ext)s'),
             'noplaylist': True,
+            'quiet': True,
+            'no_warnings': True,
+            'postprocessors': [{
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': 'mp3',
+                'preferredquality': '128',
+            }],
         }
         
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             # Get video info first
+            logger.info("Getting video info...")
             info = ydl.extract_info(url, download=False)
             title = info.get('title', 'YouTube Video')
             duration = info.get('duration', 0)
@@ -109,53 +119,102 @@ def get_video_info_and_audio(url: str) -> tuple[str, str, float]:
             logger.info(f"Video: {title}, Duration: {duration}s")
             
             # Download audio
-            audio_info = ydl.extract_info(url, download=True)
-            audio_file = ydl.prepare_filename(audio_info).replace('.webm', '.mp3').replace('.m4a', '.mp3')
+            logger.info("Downloading and converting audio...")
+            ydl.download([url])
             
+            # Find the downloaded file
+            audio_file = None
+            for file in os.listdir(temp_dir):
+                if file.startswith(safe_filename) and file.endswith('.mp3'):
+                    audio_file = os.path.join(temp_dir, file)
+                    break
+            
+            # If no mp3 found, look for any audio file
+            if not audio_file:
+                for file in os.listdir(temp_dir):
+                    if any(file.endswith(ext) for ext in ['.mp3', '.m4a', '.webm', '.wav']):
+                        audio_file = os.path.join(temp_dir, file)
+                        # Convert to mp3 if not already
+                        if not audio_file.endswith('.mp3'):
+                            import subprocess
+                            mp3_file = audio_file.replace(os.path.splitext(audio_file)[1], '.mp3')
+                            subprocess.run([
+                                'ffmpeg', '-i', audio_file, '-acodec', 'mp3', '-ab', '128k', mp3_file
+                            ], check=True, capture_output=True)
+                            os.remove(audio_file)  # Remove original
+                            audio_file = mp3_file
+                        break
+            
+            # Verify file exists and has content
+            if not audio_file or not os.path.exists(audio_file):
+                # List what files were actually created
+                files_in_temp = os.listdir(temp_dir) if os.path.exists(temp_dir) else []
+                raise FileNotFoundError(f"Audio file not found. Files in temp dir: {files_in_temp}")
+            
+            if os.path.getsize(audio_file) == 0:
+                raise ValueError("Downloaded audio file is empty")
+            
+            logger.info(f"Audio file ready: {audio_file} ({os.path.getsize(audio_file)} bytes)")
             return title, audio_file, duration
             
     except Exception as e:
         logger.error(f"Error extracting audio: {e}")
+        # Cleanup temp directory on error
+        import shutil
+        if 'temp_dir' in locals() and os.path.exists(temp_dir):
+            try:
+                shutil.rmtree(temp_dir)
+            except:
+                pass
         raise HTTPException(status_code=400, detail=f"Failed to extract audio: {str(e)}")
 
 def create_audio_chunks(audio_file: str, chunk_size_minutes: int, overlap_seconds: int = 1) -> List[tuple[str, float, float]]:
-    """Split audio into chunks with overlap"""
+    """Split audio into chunks with overlap - FIXED VERSION"""
     try:
         audio = AudioSegment.from_file(audio_file)
         audio_duration = len(audio) / 1000.0  # Convert to seconds
         
-        chunk_size_ms = chunk_size_minutes * 60 * 1000  # Convert to milliseconds
+        chunk_size_seconds = chunk_size_minutes * 60  # Convert to seconds
         overlap_ms = overlap_seconds * 1000
         
+        logger.info(f"Audio duration: {audio_duration:.1f}s, chunk size: {chunk_size_seconds}s")
+        
         chunks = []
-        start_ms = 0
+        start_time = 0.0
         chunk_id = 0
         
-        while start_ms < len(audio):
+        while start_time < audio_duration:
             # Calculate end position
-            end_ms = min(start_ms + chunk_size_ms, len(audio))
+            end_time = min(start_time + chunk_size_seconds, audio_duration)
             
-            # Extract chunk with overlap
+            # Skip chunks that are too small (less than 5 seconds)
+            if end_time - start_time < 5.0:
+                logger.info(f"Skipping tiny chunk {chunk_id}: {start_time:.1f}s - {end_time:.1f}s (too small)")
+                break
+            
+            # Convert to milliseconds for pydub
+            start_ms = int(start_time * 1000)
+            end_ms = int(end_time * 1000)
+            
+            # Extract chunk
             chunk_audio = audio[start_ms:end_ms]
             
             # Save chunk to temporary file
             chunk_filename = f"{tempfile.gettempdir()}/chunk_{chunk_id}_{uuid.uuid4().hex[:8]}.mp3"
             chunk_audio.export(chunk_filename, format="mp3")
             
-            start_time = start_ms / 1000.0
-            end_time = end_ms / 1000.0
-            
             chunks.append((chunk_filename, start_time, end_time))
             
             logger.info(f"Created chunk {chunk_id}: {start_time:.1f}s - {end_time:.1f}s ({chunk_filename})")
             
-            # Move to next chunk (subtract overlap)
-            start_ms = end_ms - overlap_ms
+            # Move to next chunk position
+            # Important: Move by chunk_size_seconds MINUS overlap, not overlap_ms
+            start_time = start_time + chunk_size_seconds - overlap_seconds
             chunk_id += 1
             
             # Safety check
-            if chunk_id > 100:  # Max 100 chunks (~6.5 hours at 4-min chunks)
-                logger.warning("Too many chunks, stopping")
+            if chunk_id > 20:  # Reasonable max for most videos
+                logger.warning(f"Too many chunks ({chunk_id}), stopping")
                 break
         
         logger.info(f"Created {len(chunks)} chunks from {audio_duration:.1f}s audio")
@@ -342,9 +401,14 @@ async def transcribe_chunked(request: ChunkingRequest):
         
         # Cleanup
         try:
-            os.remove(audio_file)
-        except:
-            pass
+            # Remove the audio file and its temp directory
+            if os.path.exists(audio_file):
+                audio_dir = os.path.dirname(audio_file)
+                shutil.rmtree(audio_dir)
+                logger.info(f"Cleaned up temp directory: {audio_dir}")
+        except Exception as cleanup_error:
+            logger.warning(f"Cleanup error: {cleanup_error}")
+
         
         # Final result
         successful_chunks = [r for r in processed_results if r.status == "completed"]
