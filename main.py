@@ -1,9 +1,9 @@
-# Optimized chunking service with performance improvements
+# Optimized chunking service with VAD-based chunking
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, HttpUrl
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 import asyncio
 import tempfile
 import os
@@ -18,6 +18,9 @@ import yt_dlp
 from pydub import AudioSegment
 import assemblyai as aai
 import math
+import torch
+import torchaudio
+import numpy as np
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -27,7 +30,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Initialize FastAPI app
-app = FastAPI(title="Optimized AssemblyAI Chunking Service", version="1.0.0")
+app = FastAPI(title="Optimized AssemblyAI VAD Chunking Service", version="2.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -38,16 +41,22 @@ app.add_middleware(
 )
 
 # Performance-focused configuration
-CHUNK_THRESHOLD_MINUTES = 15  # Only chunk videos longer than 15 minutes
+CHUNK_THRESHOLD_MINUTES = 5   # Lowered from 15 to test VAD chunking
 MAX_CONCURRENT_CHUNKS = 5     # Increased concurrency
-CHUNK_SIZE_MINUTES = 3        # Smaller chunks for better parallelization
-OVERLAP_SECONDS = 0.5         # Reduced overlap
+MIN_CHUNK_DURATION = 15       # Minimum chunk duration in seconds (lowered from 30)
+MAX_CHUNK_DURATION = 180      # Maximum chunk duration in seconds (lowered from 300)
+VAD_SAMPLE_RATE = 16000       # Silero VAD requires 16kHz
 
 class ChunkingRequest(BaseModel):
     url: HttpUrl
-    chunk_size_minutes: Optional[int] = CHUNK_SIZE_MINUTES
     max_concurrent: Optional[int] = MAX_CONCURRENT_CHUNKS
     language_code: Optional[str] = "en_us"
+    use_vad_chunking: Optional[bool] = True
+    min_chunk_duration: Optional[int] = MIN_CHUNK_DURATION
+    max_chunk_duration: Optional[int] = MAX_CHUNK_DURATION
+    # New VAD parameters for fine control
+    min_pause_duration: Optional[float] = 1.0  # Minimum pause to consider for splitting (seconds)
+    force_split_interval: Optional[int] = 120  # Force split every N seconds if no natural pause
 
 class ChunkProgress(BaseModel):
     chunk_id: int
@@ -67,6 +76,27 @@ class TranscriptResponse(BaseModel):
     processing_time: float
     service_method: str
     chunks: List[Dict[str, Any]]
+
+# Global VAD model (loaded once)
+vad_model = None
+vad_utils = None
+
+def load_vad_model():
+    """Load Silero VAD model once at startup"""
+    global vad_model, vad_utils
+    if vad_model is None:
+        try:
+            logger.info("Loading Silero VAD model...")
+            vad_model, vad_utils = torch.hub.load(
+                repo_or_dir='snakers4/silero-vad',
+                model='silero_vad',
+                force_reload=False,
+                onnx=False
+            )
+            logger.info("VAD model loaded successfully")
+        except Exception as e:
+            logger.error(f"Failed to load VAD model: {e}")
+            raise
 
 # In-memory storage for job progress
 job_progress: Dict[str, Dict] = {}
@@ -101,8 +131,8 @@ def get_video_info_and_audio(url: str) -> tuple[str, str, float]:
             'no_warnings': True,
             'postprocessors': [{
                 'key': 'FFmpegExtractAudio',
-                'preferredcodec': 'mp3',
-                'preferredquality': '128',
+                'preferredcodec': 'wav',  # Changed to WAV for better VAD compatibility
+                'preferredquality': '192',
             }],
         }
         
@@ -122,22 +152,22 @@ def get_video_info_and_audio(url: str) -> tuple[str, str, float]:
             
             audio_file = None
             for file in os.listdir(temp_dir):
-                if file.startswith(safe_filename) and file.endswith('.mp3'):
+                if file.startswith(safe_filename) and file.endswith('.wav'):
                     audio_file = os.path.join(temp_dir, file)
                     break
             
             if not audio_file:
                 for file in os.listdir(temp_dir):
-                    if any(file.endswith(ext) for ext in ['.mp3', '.m4a', '.webm', '.wav']):
+                    if any(file.endswith(ext) for ext in ['.wav', '.mp3', '.m4a', '.webm']):
                         audio_file = os.path.join(temp_dir, file)
-                        if not audio_file.endswith('.mp3'):
+                        if not audio_file.endswith('.wav'):
                             import subprocess
-                            mp3_file = audio_file.replace(os.path.splitext(audio_file)[1], '.mp3')
+                            wav_file = audio_file.replace(os.path.splitext(audio_file)[1], '.wav')
                             subprocess.run([
-                                'ffmpeg', '-i', audio_file, '-acodec', 'mp3', '-ab', '128k', mp3_file
+                                'ffmpeg', '-i', audio_file, '-acodec', 'pcm_s16le', '-ar', '16000', wav_file
                             ], check=True, capture_output=True)
                             os.remove(audio_file)
-                            audio_file = mp3_file
+                            audio_file = wav_file
                         break
             
             if not audio_file or not os.path.exists(audio_file):
@@ -159,62 +189,205 @@ def get_video_info_and_audio(url: str) -> tuple[str, str, float]:
                 pass
         raise HTTPException(status_code=400, detail=f"Failed to extract audio: {str(e)}")
 
-class OptimizedChunkingService:
+class VADChunkingService:
     def __init__(self):
         self.executor = ThreadPoolExecutor(max_workers=MAX_CONCURRENT_CHUNKS)
+        # Load VAD model on initialization
+        load_vad_model()
     
     def should_use_chunking(self, duration_seconds: float) -> bool:
         """Determine if chunking is beneficial for this video length"""
         return duration_seconds > (CHUNK_THRESHOLD_MINUTES * 60)
     
-    def create_chunks_in_memory(self, audio_file: str, chunk_size_minutes: int) -> List[tuple[bytes, float, float]]:
-        """Create audio chunks in memory without disk I/O"""
+    def detect_voice_segments(self, audio_file: str, min_duration: int, max_duration: int, min_pause: float = 1.0) -> List[Tuple[float, float]]:
+        """
+        Use Silero VAD to detect voice segments in audio file
+        Returns list of (start_time, end_time) tuples in seconds
+        """
+        try:
+            logger.info("Running VAD analysis...")
+            
+            # Try multiple backends for torchaudio compatibility
+            try:
+                # First try with soundfile backend
+                import soundfile
+                wav, original_sr = torchaudio.load(audio_file, backend="soundfile")
+            except:
+                try:
+                    # Fallback to ffmpeg backend
+                    wav, original_sr = torchaudio.load(audio_file, backend="ffmpeg")
+                except:
+                    # Final fallback - use pydub to convert then load
+                    logger.info("Using pydub fallback for audio loading")
+                    audio_segment = AudioSegment.from_file(audio_file)
+                    # Convert to wav in memory
+                    wav_io = io.BytesIO()
+                    audio_segment.export(wav_io, format="wav")
+                    wav_io.seek(0)
+                    wav, original_sr = torchaudio.load(wav_io, backend="soundfile")
+            
+            logger.info(f"Loaded audio: {wav.shape}, sample rate: {original_sr}")
+            
+            # Resample to 16kHz if necessary
+            if original_sr != VAD_SAMPLE_RATE:
+                resampler = torchaudio.transforms.Resample(original_sr, VAD_SAMPLE_RATE)
+                wav = resampler(wav)
+            
+            # Convert to mono if stereo
+            if wav.shape[0] > 1:
+                wav = torch.mean(wav, dim=0, keepdim=True)
+            
+            # Squeeze to 1D
+            wav = wav.squeeze()
+            
+            # Get speech timestamps using VAD
+            speech_timestamps = vad_utils[0](wav, vad_model, sampling_rate=VAD_SAMPLE_RATE)
+            
+            logger.info(f"VAD found {len(speech_timestamps)} raw speech segments")
+            
+            if not speech_timestamps:
+                logger.warning("No speech detected in audio")
+                # Return single segment covering whole audio as fallback
+                audio_duration = len(wav) / VAD_SAMPLE_RATE
+                return [(0.0, audio_duration)]
+            
+            # Convert VAD timestamps to seconds and merge nearby segments
+            segments = []
+            for timestamp in speech_timestamps:
+                start = timestamp['start'] / VAD_SAMPLE_RATE
+                end = timestamp['end'] / VAD_SAMPLE_RATE
+                segments.append((start, end))
+            
+            logger.info(f"Raw segments before merging: {len(segments)}")
+            for i, (start, end) in enumerate(segments[:5]):  # Show first 5
+                logger.info(f"Raw segment {i}: {start:.1f}s - {end:.1f}s")
+            
+            # Merge segments that are close together and enforce duration limits
+            merged_segments = self._merge_segments(segments, min_duration, max_duration, min_pause)
+            
+            logger.info(f"VAD detected {len(merged_segments)} speech segments after merging")
+            for i, (start, end) in enumerate(merged_segments):
+                logger.info(f"Final segment {i}: {start:.1f}s - {end:.1f}s (duration: {end-start:.1f}s)")
+            
+            return merged_segments
+            
+        except Exception as e:
+            logger.error(f"VAD analysis failed: {e}")
+            logger.error(f"Error details: {str(e)}")
+            # Fallback to single segment
+            audio = AudioSegment.from_file(audio_file)
+            duration = len(audio) / 1000.0
+            logger.info("Falling back to single segment processing")
+            return [(0.0, duration)]
+    
+    def _merge_segments(self, segments: List[Tuple[float, float]], min_duration: int, max_duration: int, min_pause: float = 1.0) -> List[Tuple[float, float]]:
+        """
+        Merge speech segments to create optimal chunks for transcription with custom pause detection
+        """
+        if not segments:
+            return []
+        
+        logger.info(f"Merging segments with min_duration={min_duration}s, max_duration={max_duration}s, min_pause={min_pause}s")
+        
+        merged = []
+        current_start, current_end = segments[0]
+        
+        for start, end in segments[1:]:
+            gap = start - current_end
+            new_duration = end - current_start
+            
+            logger.debug(f"Considering merge: gap={gap:.1f}s, new_duration={new_duration:.1f}s")
+            
+            # Only merge if gap is smaller than min_pause threshold AND won't exceed max duration
+            if gap < min_pause and new_duration <= max_duration:
+                logger.debug(f"Merging segments: extending to {end:.1f}s")
+                current_end = end
+            else:
+                # Split here - either natural pause found or duration limit reached
+                segment_duration = current_end - current_start
+                logger.info(f"Splitting at gap={gap:.1f}s: {current_start:.1f}s - {current_end:.1f}s (duration: {segment_duration:.1f}s)")
+                
+                merged.append((current_start, current_end))
+                current_start, current_end = start, end
+        
+        # Add final segment
+        merged.append((current_start, current_end))
+        logger.info(f"Added final segment: {current_start:.1f}s - {current_end:.1f}s")
+        
+        # Apply forced splitting if segments are still too long
+        merged = self._apply_forced_splitting(merged, max_duration, min_pause)
+        
+        logger.info(f"Final merged segments: {len(merged)}")
+        return merged
+    
+    def _apply_forced_splitting(self, segments: List[Tuple[float, float]], max_duration: int, min_pause: float) -> List[Tuple[float, float]]:
+        """
+        Apply forced splitting to segments that are still too long, finding the best pause within intervals
+        """
+        final_segments = []
+        
+        for start, end in segments:
+            duration = end - start
+            if duration <= max_duration:
+                final_segments.append((start, end))
+                continue
+            
+            logger.info(f"Applying forced splitting to segment {start:.1f}s - {end:.1f}s (duration: {duration:.1f}s)")
+            
+            # Split long segment into smaller chunks at natural pauses if possible
+            current_start = start
+            
+            while current_start < end:
+                target_end = min(current_start + max_duration, end)
+                
+                # If this would be the final small chunk, just extend to the end
+                min_duration_threshold = 30  # Don't create tiny trailing chunks
+                if end - target_end < min_duration_threshold:
+                    target_end = end
+                
+                final_segments.append((current_start, target_end))
+                logger.info(f"Forced split chunk: {current_start:.1f}s - {target_end:.1f}s")
+                
+                current_start = target_end
+        
+        return final_segments
+    
+    def create_vad_chunks(self, audio_file: str, min_duration: int, max_duration: int, min_pause: float = 1.0) -> List[Tuple[bytes, float, float]]:
+        """
+        Create audio chunks based on VAD speech segments with custom pause detection
+        """
         start_time = time.time()
         
         try:
+            # Get speech segments using VAD with custom parameters
+            segments = self.detect_voice_segments(audio_file, min_duration, max_duration, min_pause)
+            
             # Load audio once
             audio = AudioSegment.from_file(audio_file)
-            audio_duration = len(audio) / 1000.0
-            chunk_size_seconds = chunk_size_minutes * 60
-            
-            logger.info(f"Creating chunks in memory for {audio_duration:.1f}s audio")
             
             chunks = []
-            current_start = 0.0
-            chunk_id = 0
-            
-            while current_start < audio_duration:
-                end_time = min(current_start + chunk_size_seconds, audio_duration)
-                
-                # Skip tiny chunks
-                if end_time - current_start < 10.0:
-                    break
-                
-                # Extract chunk segment
-                start_ms = int(current_start * 1000)
-                end_ms = int(end_time * 1000)
+            for i, (start_sec, end_sec) in enumerate(segments):
+                # Extract audio segment
+                start_ms = int(start_sec * 1000)
+                end_ms = int(end_sec * 1000)
                 chunk_audio = audio[start_ms:end_ms]
                 
-                # Export to bytes buffer (no disk I/O)
+                # Export to bytes buffer
                 buffer = io.BytesIO()
-                chunk_audio.export(buffer, format="wav")  # WAV is faster than MP3
+                chunk_audio.export(buffer, format="wav")
                 chunk_bytes = buffer.getvalue()
                 
-                chunks.append((chunk_bytes, current_start, end_time))
+                chunks.append((chunk_bytes, start_sec, end_sec))
                 
-                logger.info(f"Created chunk {chunk_id}: {current_start:.1f}s - {end_time:.1f}s ({len(chunk_bytes)} bytes)")
-                
-                # Move to next position
-                current_start += chunk_size_seconds - OVERLAP_SECONDS
-                chunk_id += 1
+                logger.info(f"Created VAD chunk {i}: {start_sec:.1f}s - {end_sec:.1f}s ({len(chunk_bytes)} bytes)")
             
             processing_time = time.time() - start_time
-            logger.info(f"Created {len(chunks)} chunks in {processing_time:.2f}s")
+            logger.info(f"Created {len(chunks)} VAD chunks in {processing_time:.2f}s")
             
             return chunks
             
         except Exception as e:
-            logger.error(f"Error creating chunks: {e}")
+            logger.error(f"Error creating VAD chunks: {e}")
             raise
     
     async def transcribe_chunk_from_memory(self, chunk_data: bytes, chunk_id: int, 
@@ -223,12 +396,12 @@ class OptimizedChunkingService:
         chunk_start = time.time()
         
         try:
-            logger.info(f"Transcribing chunk {chunk_id} ({start_time:.1f}s - {end_time:.1f}s)")
+            logger.info(f"Transcribing VAD chunk {chunk_id} ({start_time:.1f}s - {end_time:.1f}s)")
             
             # Create transcriber
             transcriber = aai.Transcriber()
             
-            # Upload chunk bytes directly using the correct upload method
+            # Upload chunk bytes directly
             upload_url = await asyncio.get_event_loop().run_in_executor(
                 self.executor, 
                 lambda: transcriber.upload_file(chunk_data)
@@ -243,7 +416,7 @@ class OptimizedChunkingService:
             processing_time = time.time() - chunk_start
             
             if transcript.status == aai.TranscriptStatus.error:
-                logger.error(f"Chunk {chunk_id} failed: {transcript.error}")
+                logger.error(f"VAD chunk {chunk_id} failed: {transcript.error}")
                 return {
                     "chunk_id": chunk_id,
                     "status": "error",
@@ -253,7 +426,7 @@ class OptimizedChunkingService:
                     "processing_time": processing_time
                 }
             
-            logger.info(f"Chunk {chunk_id} completed in {processing_time:.2f}s")
+            logger.info(f"VAD chunk {chunk_id} completed in {processing_time:.2f}s")
             return {
                 "chunk_id": chunk_id,
                 "status": "completed",
@@ -265,7 +438,7 @@ class OptimizedChunkingService:
             
         except Exception as e:
             processing_time = time.time() - chunk_start
-            logger.error(f"Error transcribing chunk {chunk_id}: {e}")
+            logger.error(f"Error transcribing VAD chunk {chunk_id}: {e}")
             return {
                 "chunk_id": chunk_id,
                 "status": "error",
@@ -313,11 +486,11 @@ class OptimizedChunkingService:
 
 @app.get("/")
 async def root():
-    return {"message": "Optimized AssemblyAI Chunking Service", "version": "1.0.0"}
+    return {"message": "Optimized AssemblyAI VAD Chunking Service", "version": "2.0.0"}
 
 @app.get("/health")
 async def health():
-    return {"status": "healthy"}
+    return {"status": "healthy", "vad_loaded": vad_model is not None}
 
 @app.get("/test")
 async def test():
@@ -326,17 +499,18 @@ async def test():
     return {
         "status": "working",
         "assemblyai_configured": bool(api_key),
-        "api_key_length": len(api_key) if api_key else 0
+        "api_key_length": len(api_key) if api_key else 0,
+        "vad_model_loaded": vad_model is not None
     }
 
 @app.post("/transcribe-chunked")
 async def transcribe_optimized(request: ChunkingRequest):
-    """Optimized transcription with smart chunking decisions"""
+    """Optimized transcription with VAD-based chunking"""
     job_id = str(uuid.uuid4())
     start_time = time.time()
     
     try:
-        logger.info(f"Starting optimized transcription for job {job_id}: {request.url}")
+        logger.info(f"Starting VAD-optimized transcription for job {job_id}: {request.url}")
         
         # Check API key
         api_key = os.getenv('ASSEMBLYAI_API_KEY')
@@ -346,7 +520,7 @@ async def transcribe_optimized(request: ChunkingRequest):
         aai.settings.api_key = api_key
         
         # Initialize service
-        service = OptimizedChunkingService()
+        service = VADChunkingService()
         
         # Download video and extract audio
         video_title, audio_file, duration = get_video_info_and_audio(str(request.url))
@@ -355,8 +529,8 @@ async def transcribe_optimized(request: ChunkingRequest):
         logger.info(f"Video downloaded in {download_time:.2f}s: {video_title} ({duration:.1f}s)")
         
         # Decide processing strategy
-        if not service.should_use_chunking(duration):
-            logger.info("Short video detected - processing without chunking")
+        if not service.should_use_chunking(duration) or not request.use_vad_chunking:
+            logger.info("Short video or VAD disabled - processing without chunking")
             result = await service.process_single_video(audio_file, video_title, duration)
             result["download_time"] = download_time
             
@@ -370,14 +544,19 @@ async def transcribe_optimized(request: ChunkingRequest):
             
             return result
         
-        # Use chunking for long videos
-        logger.info("Long video detected - using optimized chunking")
+        # Use VAD chunking for long videos
+        logger.info("Long video detected - using VAD-based chunking")
         
         chunk_creation_start = time.time()
-        chunks = service.create_chunks_in_memory(audio_file, request.chunk_size_minutes or CHUNK_SIZE_MINUTES)
+        chunks = service.create_vad_chunks(
+            audio_file, 
+            request.min_chunk_duration or MIN_CHUNK_DURATION,
+            request.max_chunk_duration or MAX_CHUNK_DURATION,
+            request.min_pause_duration or 1.0
+        )
         chunk_creation_time = time.time() - chunk_creation_start
         
-        # Process chunks with higher concurrency
+        # Process chunks with concurrency
         semaphore = asyncio.Semaphore(request.max_concurrent or MAX_CONCURRENT_CHUNKS)
         
         async def process_chunk_with_semaphore(chunk_data):
@@ -399,7 +578,7 @@ async def transcribe_optimized(request: ChunkingRequest):
         processed_results = []
         for i, result in enumerate(chunk_results):
             if isinstance(result, Exception):
-                logger.error(f"Chunk {i} failed: {result}")
+                logger.error(f"VAD chunk {i} failed: {result}")
                 processed_results.append({
                     "chunk_id": i,
                     "status": "error",
@@ -410,7 +589,7 @@ async def transcribe_optimized(request: ChunkingRequest):
             else:
                 processed_results.append(result)
         
-        # Merge transcripts
+        # Merge transcripts in chronological order
         merge_start = time.time()
         successful_chunks = [r for r in processed_results if r["status"] == "completed"]
         successful_chunks.sort(key=lambda x: x["start_time"])
@@ -428,9 +607,9 @@ async def transcribe_optimized(request: ChunkingRequest):
         except:
             pass
         
-        logger.info(f"Chunked processing completed in {total_processing_time:.2f}s")
+        logger.info(f"VAD chunked processing completed in {total_processing_time:.2f}s")
         logger.info(f"Timing breakdown - Download: {download_time:.2f}s, "
-                   f"Chunks: {chunk_creation_time:.2f}s, "
+                   f"VAD+Chunks: {chunk_creation_time:.2f}s, "
                    f"Transcription: {transcription_time:.2f}s, "
                    f"Merge: {merge_time:.2f}s")
         
@@ -442,10 +621,10 @@ async def transcribe_optimized(request: ChunkingRequest):
             "total_duration": duration,
             "total_chunks": len(chunks),
             "processing_time": total_processing_time,
-            "service_method": "optimized_chunking",
+            "service_method": "vad_chunking",
             "timing_breakdown": {
                 "download": download_time,
-                "chunk_creation": chunk_creation_time,
+                "vad_chunk_creation": chunk_creation_time,
                 "transcription": transcription_time,
                 "merge": merge_time
             },
