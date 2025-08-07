@@ -1,32 +1,33 @@
-# chunking_service/main.py - Corrected AssemblyAI API
+# Optimized chunking service with performance improvements
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, HttpUrl
 from typing import Optional, List, Dict, Any
 import asyncio
-import aiohttp
 import tempfile
 import os
 import logging
-from datetime import datetime
-import json
+import time
 import uuid
+import io
+import json
+import shutil
 from concurrent.futures import ThreadPoolExecutor
 import yt_dlp
 from pydub import AudioSegment
 import assemblyai as aai
 import math
-import shutil
 
 from dotenv import load_dotenv
-load_dotenv()  # This will load the .env file
+load_dotenv()
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="AssemblyAI Chunking Service", version="1.0.0")
+# Initialize FastAPI app
+app = FastAPI(title="Optimized AssemblyAI Chunking Service", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -36,15 +37,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Global configuration
-MAX_CONCURRENT_REQUESTS = 3  # Conservative for API rate limits
-CHUNK_SIZE_MINUTES = 4  # 4-minute chunks
-OVERLAP_SECONDS = 1  # 1-second overlap to avoid word cutoffs
+# Performance-focused configuration
+CHUNK_THRESHOLD_MINUTES = 15  # Only chunk videos longer than 15 minutes
+MAX_CONCURRENT_CHUNKS = 5     # Increased concurrency
+CHUNK_SIZE_MINUTES = 3        # Smaller chunks for better parallelization
+OVERLAP_SECONDS = 0.5         # Reduced overlap
 
 class ChunkingRequest(BaseModel):
     url: HttpUrl
     chunk_size_minutes: Optional[int] = CHUNK_SIZE_MINUTES
-    max_concurrent: Optional[int] = MAX_CONCURRENT_REQUESTS
+    max_concurrent: Optional[int] = MAX_CONCURRENT_CHUNKS
     language_code: Optional[str] = "en_us"
 
 class ChunkProgress(BaseModel):
@@ -63,9 +65,10 @@ class TranscriptResponse(BaseModel):
     total_duration: float
     total_chunks: int
     processing_time: float
-    chunks: List[ChunkProgress]
+    service_method: str
+    chunks: List[Dict[str, Any]]
 
-# In-memory storage for job progress (use Redis in production)
+# In-memory storage for job progress
 job_progress: Dict[str, Dict] = {}
 
 def extract_video_id(url: str) -> str:
@@ -87,11 +90,9 @@ def extract_video_id(url: str) -> str:
 def get_video_info_and_audio(url: str) -> tuple[str, str, float]:
     """Download video info and extract audio file"""
     try:
-        # Create a unique temporary directory for this download
         temp_dir = tempfile.mkdtemp(prefix="yt_audio_")
         safe_filename = f"audio_{uuid.uuid4().hex[:8]}"
         
-        # Configure yt-dlp for audio extraction
         ydl_opts = {
             'format': 'bestaudio[ext=mp3]/bestaudio/best',
             'outtmpl': os.path.join(temp_dir, f'{safe_filename}.%(ext)s'),
@@ -106,48 +107,40 @@ def get_video_info_and_audio(url: str) -> tuple[str, str, float]:
         }
         
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            # Get video info first
             logger.info("Getting video info...")
             info = ydl.extract_info(url, download=False)
             title = info.get('title', 'YouTube Video')
             duration = info.get('duration', 0)
             
-            # Skip very long videos (> 3 hours) to avoid timeout
             if duration > 10800:
                 raise ValueError("Video is too long (>3 hours). Please try a shorter video.")
             
             logger.info(f"Video: {title}, Duration: {duration}s")
             
-            # Download audio
             logger.info("Downloading and converting audio...")
             ydl.download([url])
             
-            # Find the downloaded file
             audio_file = None
             for file in os.listdir(temp_dir):
                 if file.startswith(safe_filename) and file.endswith('.mp3'):
                     audio_file = os.path.join(temp_dir, file)
                     break
             
-            # If no mp3 found, look for any audio file
             if not audio_file:
                 for file in os.listdir(temp_dir):
                     if any(file.endswith(ext) for ext in ['.mp3', '.m4a', '.webm', '.wav']):
                         audio_file = os.path.join(temp_dir, file)
-                        # Convert to mp3 if not already
                         if not audio_file.endswith('.mp3'):
                             import subprocess
                             mp3_file = audio_file.replace(os.path.splitext(audio_file)[1], '.mp3')
                             subprocess.run([
                                 'ffmpeg', '-i', audio_file, '-acodec', 'mp3', '-ab', '128k', mp3_file
                             ], check=True, capture_output=True)
-                            os.remove(audio_file)  # Remove original
+                            os.remove(audio_file)
                             audio_file = mp3_file
                         break
             
-            # Verify file exists and has content
             if not audio_file or not os.path.exists(audio_file):
-                # List what files were actually created
                 files_in_temp = os.listdir(temp_dir) if os.path.exists(temp_dir) else []
                 raise FileNotFoundError(f"Audio file not found. Files in temp dir: {files_in_temp}")
             
@@ -159,8 +152,6 @@ def get_video_info_and_audio(url: str) -> tuple[str, str, float]:
             
     except Exception as e:
         logger.error(f"Error extracting audio: {e}")
-        # Cleanup temp directory on error
-        import shutil
         if 'temp_dir' in locals() and os.path.exists(temp_dir):
             try:
                 shutil.rmtree(temp_dir)
@@ -168,281 +159,313 @@ def get_video_info_and_audio(url: str) -> tuple[str, str, float]:
                 pass
         raise HTTPException(status_code=400, detail=f"Failed to extract audio: {str(e)}")
 
-def create_audio_chunks(audio_file: str, chunk_size_minutes: int, overlap_seconds: int = 1) -> List[tuple[str, float, float]]:
-    """Split audio into chunks with overlap - FIXED VERSION"""
-    try:
-        audio = AudioSegment.from_file(audio_file)
-        audio_duration = len(audio) / 1000.0  # Convert to seconds
-        
-        chunk_size_seconds = chunk_size_minutes * 60  # Convert to seconds
-        overlap_ms = overlap_seconds * 1000
-        
-        logger.info(f"Audio duration: {audio_duration:.1f}s, chunk size: {chunk_size_seconds}s")
-        
-        chunks = []
-        start_time = 0.0
-        chunk_id = 0
-        
-        while start_time < audio_duration:
-            # Calculate end position
-            end_time = min(start_time + chunk_size_seconds, audio_duration)
-            
-            # Skip chunks that are too small (less than 5 seconds)
-            if end_time - start_time < 5.0:
-                logger.info(f"Skipping tiny chunk {chunk_id}: {start_time:.1f}s - {end_time:.1f}s (too small)")
-                break
-            
-            # Convert to milliseconds for pydub
-            start_ms = int(start_time * 1000)
-            end_ms = int(end_time * 1000)
-            
-            # Extract chunk
-            chunk_audio = audio[start_ms:end_ms]
-            
-            # Save chunk to temporary file
-            chunk_filename = f"{tempfile.gettempdir()}/chunk_{chunk_id}_{uuid.uuid4().hex[:8]}.mp3"
-            chunk_audio.export(chunk_filename, format="mp3")
-            
-            chunks.append((chunk_filename, start_time, end_time))
-            
-            logger.info(f"Created chunk {chunk_id}: {start_time:.1f}s - {end_time:.1f}s ({chunk_filename})")
-            
-            # Move to next chunk position
-            # Important: Move by chunk_size_seconds MINUS overlap, not overlap_ms
-            start_time = start_time + chunk_size_seconds - overlap_seconds
-            chunk_id += 1
-            
-            # Safety check
-            if chunk_id > 20:  # Reasonable max for most videos
-                logger.warning(f"Too many chunks ({chunk_id}), stopping")
-                break
-        
-        logger.info(f"Created {len(chunks)} chunks from {audio_duration:.1f}s audio")
-        return chunks
-        
-    except Exception as e:
-        logger.error(f"Error creating chunks: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to create audio chunks: {str(e)}")
-
-async def transcribe_chunk_async(chunk_file: str, chunk_id: int, start_time: float, end_time: float) -> ChunkProgress:
-    """Transcribe a single chunk asynchronously using correct AssemblyAI API"""
-    progress = ChunkProgress(
-        chunk_id=chunk_id,
-        status="processing",
-        start_time=start_time,
-        end_time=end_time
-    )
+class OptimizedChunkingService:
+    def __init__(self):
+        self.executor = ThreadPoolExecutor(max_workers=MAX_CONCURRENT_CHUNKS)
     
-    chunk_start_time = asyncio.get_event_loop().time()
+    def should_use_chunking(self, duration_seconds: float) -> bool:
+        """Determine if chunking is beneficial for this video length"""
+        return duration_seconds > (CHUNK_THRESHOLD_MINUTES * 60)
     
-    try:
-        logger.info(f"Starting transcription for chunk {chunk_id} ({start_time:.1f}s - {end_time:.1f}s)")
+    def create_chunks_in_memory(self, audio_file: str, chunk_size_minutes: int) -> List[tuple[bytes, float, float]]:
+        """Create audio chunks in memory without disk I/O"""
+        start_time = time.time()
         
-        # Create transcriber
+        try:
+            # Load audio once
+            audio = AudioSegment.from_file(audio_file)
+            audio_duration = len(audio) / 1000.0
+            chunk_size_seconds = chunk_size_minutes * 60
+            
+            logger.info(f"Creating chunks in memory for {audio_duration:.1f}s audio")
+            
+            chunks = []
+            current_start = 0.0
+            chunk_id = 0
+            
+            while current_start < audio_duration:
+                end_time = min(current_start + chunk_size_seconds, audio_duration)
+                
+                # Skip tiny chunks
+                if end_time - current_start < 10.0:
+                    break
+                
+                # Extract chunk segment
+                start_ms = int(current_start * 1000)
+                end_ms = int(end_time * 1000)
+                chunk_audio = audio[start_ms:end_ms]
+                
+                # Export to bytes buffer (no disk I/O)
+                buffer = io.BytesIO()
+                chunk_audio.export(buffer, format="wav")  # WAV is faster than MP3
+                chunk_bytes = buffer.getvalue()
+                
+                chunks.append((chunk_bytes, current_start, end_time))
+                
+                logger.info(f"Created chunk {chunk_id}: {current_start:.1f}s - {end_time:.1f}s ({len(chunk_bytes)} bytes)")
+                
+                # Move to next position
+                current_start += chunk_size_seconds - OVERLAP_SECONDS
+                chunk_id += 1
+            
+            processing_time = time.time() - start_time
+            logger.info(f"Created {len(chunks)} chunks in {processing_time:.2f}s")
+            
+            return chunks
+            
+        except Exception as e:
+            logger.error(f"Error creating chunks: {e}")
+            raise
+    
+    async def transcribe_chunk_from_memory(self, chunk_data: bytes, chunk_id: int, 
+                                         start_time: float, end_time: float) -> dict:
+        """Transcribe chunk directly from memory"""
+        chunk_start = time.time()
+        
+        try:
+            logger.info(f"Transcribing chunk {chunk_id} ({start_time:.1f}s - {end_time:.1f}s)")
+            
+            # Create transcriber and upload chunk
+            transcriber = aai.Transcriber()
+            
+            # Upload chunk bytes directly using the files API
+            upload_url = await asyncio.get_event_loop().run_in_executor(
+                self.executor, 
+                lambda: aai.upload(chunk_data)  # Use the direct upload function
+            )
+            
+            # Transcribe
+            transcript = await asyncio.get_event_loop().run_in_executor(
+                self.executor,
+                lambda: transcriber.transcribe(upload_url)
+            )
+            
+            processing_time = time.time() - chunk_start
+            
+            if transcript.status == aai.TranscriptStatus.error:
+                logger.error(f"Chunk {chunk_id} failed: {transcript.error}")
+                return {
+                    "chunk_id": chunk_id,
+                    "status": "error",
+                    "start_time": start_time,
+                    "end_time": end_time,
+                    "error": transcript.error,
+                    "processing_time": processing_time
+                }
+            
+            logger.info(f"Chunk {chunk_id} completed in {processing_time:.2f}s")
+            return {
+                "chunk_id": chunk_id,
+                "status": "completed",
+                "start_time": start_time,
+                "end_time": end_time,
+                "text": transcript.text,
+                "processing_time": processing_time
+            }
+            
+        except Exception as e:
+            processing_time = time.time() - chunk_start
+            logger.error(f"Error transcribing chunk {chunk_id}: {e}")
+            return {
+                "chunk_id": chunk_id,
+                "status": "error",
+                "start_time": start_time,
+                "end_time": end_time,
+                "error": str(e),
+                "processing_time": processing_time
+            }
+    
+    async def process_single_video(self, audio_file: str, title: str, duration: float) -> dict:
+        """Process short video without chunking"""
+        logger.info(f"Processing {title} as single unit (duration: {duration:.1f}s)")
+        
+        start_time = time.time()
         transcriber = aai.Transcriber()
         
-        # Upload file and transcribe directly
+        # Upload and transcribe in one go
         transcript = await asyncio.get_event_loop().run_in_executor(
-            None, lambda: transcriber.transcribe(chunk_file)
+            self.executor,
+            lambda: transcriber.transcribe(audio_file)
         )
         
+        processing_time = time.time() - start_time
+        
         if transcript.status == aai.TranscriptStatus.error:
-            progress.status = "error"
-            progress.error = transcript.error
-            logger.error(f"Chunk {chunk_id} failed: {transcript.error}")
-        else:
-            progress.status = "completed"
-            progress.text = transcript.text
-            logger.info(f"Chunk {chunk_id} completed: {len(transcript.text) if transcript.text else 0} characters")
+            raise HTTPException(status_code=500, detail=f"Transcription failed: {transcript.error}")
         
-        progress.processing_time = asyncio.get_event_loop().time() - chunk_start_time
-        
-    except Exception as e:
-        progress.status = "error"
-        progress.error = str(e)
-        progress.processing_time = asyncio.get_event_loop().time() - chunk_start_time
-        logger.error(f"Error processing chunk {chunk_id}: {e}")
-    
-    finally:
-        # Cleanup chunk file
-        try:
-            os.remove(chunk_file)
-        except:
-            pass
-    
-    return progress
-
-def merge_chunk_transcripts(chunk_results: List[ChunkProgress], overlap_seconds: int = 1) -> str:
-    """Merge transcripts from chunks, handling overlaps"""
-    if not chunk_results:
-        return ""
-    
-    # Sort by start time
-    chunk_results.sort(key=lambda x: x.start_time)
-    
-    merged_text = []
-    
-    for i, chunk in enumerate(chunk_results):
-        if chunk.status != "completed" or not chunk.text:
-            logger.warning(f"Skipping chunk {chunk.chunk_id} - status: {chunk.status}")
-            continue
-        
-        text = chunk.text.strip()
-        
-        if i == 0:
-            # First chunk - use as-is
-            merged_text.append(text)
-        else:
-            # Subsequent chunks - try to remove overlap
-            # Simple approach: remove first few words that might overlap
-            words = text.split()
-            if len(words) > 3:
-                # Skip first 3 words to handle overlap
-                overlap_removed = " ".join(words[3:])
-                merged_text.append(overlap_removed)
-            else:
-                merged_text.append(text)
-    
-    return " ".join(merged_text)
+        return {
+            "text": transcript.text,
+            "status": "completed",
+            "video_title": title,
+            "audio_duration": duration,  # Changed from total_duration to match frontend
+            "total_duration": duration,
+            "total_chunks": 1,
+            "processing_time": processing_time,
+            "service_method": "single_unit",
+            "chunks": [{
+                "chunk_id": 0,
+                "status": "completed",
+                "start_time": 0.0,
+                "end_time": duration,
+                "processing_time": processing_time
+            }]
+        }
 
 @app.get("/")
 async def root():
-    return {"message": "AssemblyAI Chunking Service", "version": "1.0.0"}
+    return {"message": "Optimized AssemblyAI Chunking Service", "version": "1.0.0"}
 
 @app.get("/health")
 async def health():
     return {"status": "healthy"}
 
+@app.get("/test")
+async def test():
+    """Test endpoint to verify service is working"""
+    api_key = os.getenv('ASSEMBLYAI_API_KEY')
+    return {
+        "status": "working",
+        "assemblyai_configured": bool(api_key),
+        "api_key_length": len(api_key) if api_key else 0
+    }
+
+# Updated main transcription endpoint
 @app.post("/transcribe-chunked")
-async def transcribe_chunked(request: ChunkingRequest):
-    """Transcribe video using chunking strategy"""
+async def transcribe_optimized(request: ChunkingRequest):
+    """Optimized transcription with smart chunking decisions"""
     job_id = str(uuid.uuid4())
-    start_time = asyncio.get_event_loop().time()
+    start_time = time.time()
     
     try:
-        # Initialize job progress
-        job_progress[job_id] = {
-            "status": "downloading",
-            "progress": 0,
-            "message": "Downloading and extracting audio..."
-        }
+        logger.info(f"Starting optimized transcription for job {job_id}: {request.url}")
         
-        logger.info(f"Starting chunked transcription for job {job_id}: {request.url}")
-        
-        # Check if AssemblyAI API key is configured
+        # Check API key
         api_key = os.getenv('ASSEMBLYAI_API_KEY')
         if not api_key:
             raise HTTPException(status_code=500, detail="AssemblyAI API key not configured")
         
-        # Set API key for AssemblyAI
         aai.settings.api_key = api_key
         
-        # Step 1: Download video and extract audio
+        # Initialize service
+        service = OptimizedChunkingService()
+        
+        # Download video and extract audio
         video_title, audio_file, duration = get_video_info_and_audio(str(request.url))
+        download_time = time.time() - start_time
         
-        job_progress[job_id].update({
-            "status": "chunking",
-            "message": f"Creating audio chunks for {video_title}..."
-        })
+        logger.info(f"Video downloaded in {download_time:.2f}s: {video_title} ({duration:.1f}s)")
         
-        # Step 2: Create chunks (skip chunking for short videos)
-        if duration < 300:  # Less than 5 minutes
-            logger.info("Short video detected, skipping chunking")
-            chunk_size_minutes = int(duration / 60) + 1  # Single chunk
-        else:
-            chunk_size_minutes = request.chunk_size_minutes
+        # Decide processing strategy
+        if not service.should_use_chunking(duration):
+            logger.info("Short video detected - processing without chunking")
+            result = await service.process_single_video(audio_file, video_title, duration)
+            result["download_time"] = download_time
+            
+            # Cleanup
+            try:
+                if os.path.exists(audio_file):
+                    audio_dir = os.path.dirname(audio_file)
+                    shutil.rmtree(audio_dir)
+            except:
+                pass
+            
+            return result
         
-        chunks = create_audio_chunks(audio_file, chunk_size_minutes, OVERLAP_SECONDS)
+        # Use chunking for long videos
+        logger.info("Long video detected - using optimized chunking")
         
-        job_progress[job_id].update({
-            "status": "transcribing",
-            "message": f"Transcribing {len(chunks)} chunks in parallel...",
-            "total_chunks": len(chunks)
-        })
+        chunk_creation_start = time.time()
+        chunks = service.create_chunks_in_memory(audio_file, request.chunk_size_minutes or CHUNK_SIZE_MINUTES)
+        chunk_creation_time = time.time() - chunk_creation_start
         
-        # Step 3: Process chunks in parallel with semaphore
-        semaphore = asyncio.Semaphore(request.max_concurrent)
+        # Process chunks with higher concurrency
+        semaphore = asyncio.Semaphore(request.max_concurrent or MAX_CONCURRENT_CHUNKS)
         
-        async def transcribe_with_semaphore(chunk_data):
+        async def process_chunk_with_semaphore(chunk_data):
             async with semaphore:
-                chunk_file, start_time, end_time = chunk_data
+                chunk_bytes, start_t, end_t = chunk_data
                 chunk_id = chunks.index(chunk_data)
-                return await transcribe_chunk_async(chunk_file, chunk_id, start_time, end_time)
+                return await service.transcribe_chunk_from_memory(
+                    chunk_bytes, chunk_id, start_t, end_t
+                )
         
-        # Process all chunks concurrently
+        transcription_start = time.time()
         chunk_results = await asyncio.gather(
-            *[transcribe_with_semaphore(chunk_data) for chunk_data in chunks],
+            *[process_chunk_with_semaphore(chunk_data) for chunk_data in chunks],
             return_exceptions=True
         )
+        transcription_time = time.time() - transcription_start
         
-        # Handle any exceptions
+        # Process results
         processed_results = []
         for i, result in enumerate(chunk_results):
             if isinstance(result, Exception):
-                logger.error(f"Chunk {i} failed with exception: {result}")
-                processed_results.append(ChunkProgress(
-                    chunk_id=i,
-                    status="error",
-                    start_time=chunks[i][1],
-                    end_time=chunks[i][2],
-                    error=str(result)
-                ))
+                logger.error(f"Chunk {i} failed: {result}")
+                processed_results.append({
+                    "chunk_id": i,
+                    "status": "error",
+                    "start_time": chunks[i][1],
+                    "end_time": chunks[i][2],
+                    "error": str(result)
+                })
             else:
                 processed_results.append(result)
         
-        # Step 4: Merge results
-        job_progress[job_id].update({
-            "status": "merging",
-            "message": "Merging chunk transcripts..."
-        })
+        # Merge transcripts
+        merge_start = time.time()
+        successful_chunks = [r for r in processed_results if r["status"] == "completed"]
+        successful_chunks.sort(key=lambda x: x["start_time"])
         
-        final_text = merge_chunk_transcripts(processed_results, OVERLAP_SECONDS)
-        total_processing_time = asyncio.get_event_loop().time() - start_time
+        merged_text = " ".join([chunk["text"] for chunk in successful_chunks if chunk.get("text")])
+        merge_time = time.time() - merge_start
+        
+        total_processing_time = time.time() - start_time
         
         # Cleanup
         try:
-            # Remove the audio file and its temp directory
             if os.path.exists(audio_file):
                 audio_dir = os.path.dirname(audio_file)
                 shutil.rmtree(audio_dir)
-                logger.info(f"Cleaned up temp directory: {audio_dir}")
-        except Exception as cleanup_error:
-            logger.warning(f"Cleanup error: {cleanup_error}")
-
+        except:
+            pass
         
-        # Final result
-        successful_chunks = [r for r in processed_results if r.status == "completed"]
-        failed_chunks = [r for r in processed_results if r.status == "error"]
+        logger.info(f"Chunked processing completed in {total_processing_time:.2f}s")
+        logger.info(f"Timing breakdown - Download: {download_time:.2f}s, "
+                   f"Chunks: {chunk_creation_time:.2f}s, "
+                   f"Transcription: {transcription_time:.2f}s, "
+                   f"Merge: {merge_time:.2f}s")
         
-        logger.info(f"Job {job_id} completed: {len(successful_chunks)}/{len(chunks)} chunks successful")
-        
-        if not successful_chunks:
-            raise HTTPException(status_code=500, detail="All chunks failed to process")
-        
-        job_progress[job_id].update({
+        return {
+            "text": merged_text,
             "status": "completed",
-            "message": f"Transcription completed in {total_processing_time:.1f}s"
-        })
-        
-        return TranscriptResponse(
-            text=final_text,
-            status="completed",
-            video_title=video_title,
-            total_duration=duration,
-            total_chunks=len(chunks),
-            processing_time=total_processing_time,
-            chunks=processed_results
-        )
+            "video_title": video_title,
+            "audio_duration": duration,  # Added to match frontend expectations
+            "total_duration": duration,
+            "total_chunks": len(chunks),
+            "processing_time": total_processing_time,
+            "service_method": "optimized_chunking",
+            "timing_breakdown": {
+                "download": download_time,
+                "chunk_creation": chunk_creation_time,
+                "transcription": transcription_time,
+                "merge": merge_time
+            },
+            "chunks": processed_results
+        }
         
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Job {job_id} failed: {e}")
-        job_progress[job_id].update({
-            "status": "error",
-            "message": str(e)
-        })
-        raise HTTPException(status_code=500, detail=f"Transcription failed: {str(e)}")
+        logger.error(f"Job {job_id} failed with error: {e}")
+        logger.error(f"Error type: {type(e)}")
+        import traceback
+        logger.error(f"Full traceback: {traceback.format_exc()}")
+        
+        # Return a more detailed error response
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Transcription failed: {str(e)} (Type: {type(e).__name__})"
+        )
 
 @app.get("/job/{job_id}")
 async def get_job_status(job_id: str):
@@ -457,7 +480,7 @@ if __name__ == "__main__":
     uvicorn.run(
         "main:app", 
         host="0.0.0.0", 
-        port=8002,  # Different port from transcript service
+        port=8002,
         reload=True,
         log_level="info"
     )
