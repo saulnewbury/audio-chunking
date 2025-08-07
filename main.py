@@ -225,13 +225,13 @@ class OptimizedChunkingService:
         try:
             logger.info(f"Transcribing chunk {chunk_id} ({start_time:.1f}s - {end_time:.1f}s)")
             
-            # Create transcriber and upload chunk
+            # Create transcriber
             transcriber = aai.Transcriber()
             
-            # Upload chunk bytes directly using the files API
+            # Upload chunk bytes directly using the correct upload method
             upload_url = await asyncio.get_event_loop().run_in_executor(
                 self.executor, 
-                lambda: aai.upload(chunk_data)  # Use the direct upload function
+                lambda: transcriber.upload_file(chunk_data)
             )
             
             # Transcribe
@@ -274,7 +274,7 @@ class OptimizedChunkingService:
                 "error": str(e),
                 "processing_time": processing_time
             }
-    
+
     async def process_single_video(self, audio_file: str, title: str, duration: float) -> dict:
         """Process short video without chunking"""
         logger.info(f"Processing {title} as single unit (duration: {duration:.1f}s)")
@@ -297,7 +297,7 @@ class OptimizedChunkingService:
             "text": transcript.text,
             "status": "completed",
             "video_title": title,
-            "audio_duration": duration,  # Changed from total_duration to match frontend
+            "audio_duration": duration,
             "total_duration": duration,
             "total_chunks": 1,
             "processing_time": processing_time,
@@ -329,7 +329,6 @@ async def test():
         "api_key_length": len(api_key) if api_key else 0
     }
 
-# Updated main transcription endpoint
 @app.post("/transcribe-chunked")
 async def transcribe_optimized(request: ChunkingRequest):
     """Optimized transcription with smart chunking decisions"""
@@ -439,7 +438,7 @@ async def transcribe_optimized(request: ChunkingRequest):
             "text": merged_text,
             "status": "completed",
             "video_title": video_title,
-            "audio_duration": duration,  # Added to match frontend expectations
+            "audio_duration": duration,
             "total_duration": duration,
             "total_chunks": len(chunks),
             "processing_time": total_processing_time,
