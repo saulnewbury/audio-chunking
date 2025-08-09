@@ -16,10 +16,10 @@ async def test_local_whisper():
     try:
         async with websockets.connect(uri) as websocket:
             request = {
-                "video_url": "https://www.youtube.com/watch?v=D1R-jKKp3NA",
-                "chunk_duration_seconds": 60.0,   # Larger chunks for local processing
-                "max_concurrent_chunks": 4,       # Match CPU cores
-                "model_size": "base"               # Fast model
+             "video_url": "https://www.youtube.com/watch?v=D1R-jKKp3NA",
+              "chunk_duration_seconds": 30.0,  # More chunks for parallelism
+              "max_concurrent_chunks": 8,      # Match M1/M2 core count
+              "model_size": "tiny"            # Faster model
             }
             
             start_time = time.time()
