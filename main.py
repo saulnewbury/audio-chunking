@@ -1,36 +1,600 @@
-# Optimized chunking service with VAD-based chunking
-from fastapi import FastAPI, HTTPException, BackgroundTasks
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, HttpUrl
-from typing import Optional, List, Dict, Any, Tuple
+"""
+Real-Time Streaming Transcription Service with AssemblyAI Universal-Streaming (v3)
+Updated to use the new Universal-Streaming API
+"""
+
 import asyncio
+import websockets
+import json
+import base64
+import io
 import tempfile
-import os
 import logging
 import time
 import uuid
-import io
-import json
+import os
 import shutil
+from typing import AsyncGenerator, Optional, Dict, Any, List
+from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor
+import aiohttp
+import aiofiles
+
+from fastapi import FastAPI, WebSocket, HTTPException, BackgroundTasks
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, HttpUrl
+
 import yt_dlp
 from pydub import AudioSegment
-import assemblyai as aai
-import math
-import torch
-import torchaudio
+import soundfile as sf
 import numpy as np
-
-from dotenv import load_dotenv
-load_dotenv()
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Initialize FastAPI app
-app = FastAPI(title="Optimized AssemblyAI VAD Chunking Service", version="2.0.0")
+# Load environment variables
+from dotenv import load_dotenv
+load_dotenv()
+
+@dataclass
+class TranscriptChunk:
+    text: str
+    confidence: float
+    turn_order: int
+    end_of_turn: bool
+    is_formatted: bool
+    chunk_id: int
+
+@dataclass
+class StreamProgress:
+    chunk_id: int
+    timestamp: float
+    duration_processed: float
+    total_duration: Optional[float]
+    status: str
+
+class StreamingRequest(BaseModel):
+    url: HttpUrl
+    chunk_duration_ms: Optional[int] = 200  # Optimal for AssemblyAI
+    enable_formatting: Optional[bool] = True
+    sample_rate: Optional[int] = 16000
+
+class UniversalStreamingPipeline:
+    def __init__(self, api_key: str):
+        self.api_key = api_key
+        self.websocket: Optional[websockets.WebSocketServerProtocol] = None
+        self.session_active = False
+        self.transcript_chunks: List[TranscriptChunk] = []
+        self.executor = ThreadPoolExecutor(max_workers=2)
+        self._message_queue = asyncio.Queue()
+        
+    async def connect_websocket(
+        self, 
+        sample_rate: int = 16000,
+        enable_formatting: bool = True
+    ) -> None:
+        """Connect to AssemblyAI Universal-Streaming API"""
+        try:
+            # Universal-Streaming v3 WebSocket URL
+            uri = "wss://streaming.assemblyai.com/v3/ws"
+            
+            # Use Authorization header with API key (no Bearer prefix)
+            headers = {"Authorization": self.api_key}
+            
+            self.websocket = await websockets.connect(uri, additional_headers=headers)
+            self.session_active = True
+            
+            logger.info("Connected to AssemblyAI Universal-Streaming (v3)")
+            
+            # Wait for Begin message
+            begin_msg = await self.websocket.recv()
+            begin_data = json.loads(begin_msg)
+            
+            if begin_data.get("type") == "Begin":
+                session_id = begin_data.get("id")
+                expires_at = begin_data.get("expires_at")
+                logger.info(f"Session started: {session_id}, expires at: {expires_at}")
+                
+                await self._message_queue.put({
+                    "type": "session_started",
+                    "data": f"Universal-Streaming session {session_id} started"
+                })
+            else:
+                logger.warning(f"Unexpected begin message: {begin_data}")
+            
+            # Start listening for transcription results (Turn messages)
+            asyncio.create_task(self._listen_for_transcripts())
+            
+        except Exception as e:
+            logger.error(f"WebSocket connection failed: {e}")
+            raise
+
+    async def _listen_for_transcripts(self) -> None:
+        """Listen for Turn messages from Universal-Streaming"""
+        try:
+            async for message in self.websocket:
+                try:
+                    data = json.loads(message)
+                    message_type = data.get("type")
+                    
+                    if message_type == "Turn":
+                        # Handle Universal-Streaming Turn message
+                        transcript_text = data.get("transcript", "").strip()
+                        end_of_turn = data.get("end_of_turn", False)
+                        turn_order = data.get("turn_order", 0)
+                        turn_is_formatted = data.get("turn_is_formatted", False)
+                        end_of_turn_confidence = data.get("end_of_turn_confidence", 1.0)
+                        
+                        if transcript_text:  # Only process non-empty transcripts
+                            transcript_chunk = TranscriptChunk(
+                                text=transcript_text,
+                                confidence=end_of_turn_confidence,
+                                turn_order=turn_order,
+                                end_of_turn=end_of_turn,
+                                is_formatted=turn_is_formatted,
+                                chunk_id=turn_order
+                            )
+                            
+                            await self._message_queue.put({
+                                "type": "transcript",
+                                "data": transcript_chunk
+                            })
+                            
+                            # Store completed turns
+                            if end_of_turn:
+                                self.transcript_chunks.append(transcript_chunk)
+                                
+                            logger.info(f"Turn {turn_order}: {transcript_text} (end_of_turn: {end_of_turn})")
+                        
+                    elif message_type == "Termination":
+                        logger.info("Universal-Streaming session terminated")
+                        await self._message_queue.put({
+                            "type": "session_ended",
+                            "data": "Session terminated"
+                        })
+                        break
+                        
+                    else:
+                        logger.debug(f"Unknown message type: {message_type}")
+                        
+                except json.JSONDecodeError:
+                    logger.warning(f"Received non-JSON message: {message}")
+                except Exception as e:
+                    logger.error(f"Error processing message: {e}")
+                    
+        except websockets.exceptions.ConnectionClosed:
+            logger.info("WebSocket connection closed")
+        except Exception as e:
+            logger.error(f"Error listening for transcripts: {e}")
+            await self._message_queue.put({
+                "type": "error", 
+                "data": f"Transcript listening error: {str(e)}"
+            })
+
+    async def _send_audio_chunk(self, audio_chunk: bytes) -> None:
+        """Send raw audio bytes to Universal-Streaming WebSocket"""
+        if not self.websocket or not self.session_active:
+            raise Exception("WebSocket not connected")
+        
+        try:
+            # Universal-Streaming expects raw PCM16 audio bytes, not JSON
+            await self.websocket.send(audio_chunk)
+            
+        except Exception as e:
+            logger.error(f"Error sending audio chunk: {e}")
+            raise
+
+    async def _end_transcription_session(self) -> None:
+        """Close the Universal-Streaming session"""
+        if self.websocket and self.session_active:
+            try:
+                # Universal-Streaming closes when WebSocket closes
+                await self.websocket.close()
+                self.session_active = False
+                logger.info("Universal-Streaming session ended")
+            except Exception as e:
+                logger.error(f"Error ending session: {e}")
+
+    async def _listen_for_transcripts(self) -> None:
+        """Listen for incoming transcription results from Universal-Streaming"""
+        try:
+            turn_order = 0
+            async for message in self.websocket:
+                try:
+                    data = json.loads(message)
+                    message_type = data.get("type")
+                    
+                    if message_type == "session_started":
+                        logger.info("Universal-Streaming session started")
+                        await self._message_queue.put({
+                            "type": "session_started",
+                            "data": "Session started successfully"
+                        })
+                        
+                    elif message_type == "transcript":
+                        # Handle Universal-Streaming transcript format
+                        transcript_text = data.get("transcript", "").strip()
+                        end_of_turn = data.get("end_of_turn", False)
+                        turn_is_formatted = data.get("turn_is_formatted", False)
+                        turn_order_val = data.get("turn_order", turn_order)
+                        end_of_turn_confidence = data.get("end_of_turn_confidence", 1.0)
+                        
+                        if transcript_text:  # Only process non-empty transcripts
+                            transcript_chunk = TranscriptChunk(
+                                text=transcript_text,
+                                confidence=end_of_turn_confidence,
+                                turn_order=turn_order_val,
+                                end_of_turn=end_of_turn,
+                                is_formatted=turn_is_formatted,
+                                chunk_id=turn_order_val
+                            )
+                            
+                            await self._message_queue.put({
+                                "type": "transcript",
+                                "data": transcript_chunk
+                            })
+                            
+                            # Store completed turns
+                            if end_of_turn:
+                                self.transcript_chunks.append(transcript_chunk)
+                                turn_order += 1
+                                
+                            logger.info(f"Turn {turn_order_val}: {transcript_text} (end_of_turn: {end_of_turn})")
+                        
+                    elif message_type == "error":
+                        error_msg = data.get("message", "Unknown error")
+                        logger.error(f"Universal-Streaming error: {error_msg}")
+                        await self._message_queue.put({
+                            "type": "error",
+                            "data": error_msg
+                        })
+                        
+                    elif message_type == "session_ended":
+                        logger.info("Universal-Streaming session ended")
+                        await self._message_queue.put({
+                            "type": "session_ended",
+                            "data": "Session ended"
+                        })
+                        
+                except json.JSONDecodeError:
+                    logger.warning(f"Received non-JSON message: {message}")
+                except Exception as e:
+                    logger.error(f"Error processing transcript message: {e}")
+                    
+        except websockets.exceptions.ConnectionClosed:
+            logger.info("WebSocket connection closed")
+        except Exception as e:
+            logger.error(f"Error listening for transcripts: {e}")
+            await self._message_queue.put({
+                "type": "error", 
+                "data": f"Transcript listening error: {str(e)}"
+            })
+
+    async def download_and_process_video(
+        self, 
+        video_url: str,
+        chunk_duration_ms: int = 200
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """Download video and process audio in streaming fashion"""
+        temp_dir = None
+        
+        try:
+            # Setup temporary directory
+            temp_dir = tempfile.mkdtemp(prefix="streaming_")
+            
+            # Get video info first
+            ydl_opts_info = {
+                'quiet': True,
+                'no_warnings': True,
+            }
+            
+            with yt_dlp.YoutubeDL(ydl_opts_info) as ydl:
+                info = ydl.extract_info(video_url, download=False)
+                video_title = info.get('title', 'Unknown Video')
+                total_duration = info.get('duration', 0)
+                
+                yield {
+                    "type": "video_info",
+                    "title": video_title,
+                    "duration": total_duration,
+                    "status": "starting_download"
+                }
+                
+                logger.info(f"Processing: {video_title} ({total_duration}s)")
+            
+            # Download with best audio quality
+            audio_file = await self._download_audio(video_url, temp_dir)
+            
+            yield {
+                "type": "download_complete",
+                "audio_file": os.path.basename(audio_file),
+                "status": "starting_audio_processing"
+            }
+            
+            # Process audio in chunks
+            async for chunk_result in self._process_audio_chunks(
+                audio_file, chunk_duration_ms, total_duration
+            ):
+                yield chunk_result
+                
+        except Exception as e:
+            logger.error(f"Error in video processing: {e}")
+            yield {
+                "type": "error",
+                "message": str(e)
+            }
+        finally:
+            # Cleanup
+            if temp_dir and os.path.exists(temp_dir):
+                shutil.rmtree(temp_dir, ignore_errors=True)
+
+    async def _download_audio(self, video_url: str, temp_dir: str) -> str:
+        """Download and extract audio from video"""
+        def download_sync():
+            ydl_opts = {
+                'format': 'bestaudio[ext=m4a]/bestaudio/best',
+                'outtmpl': os.path.join(temp_dir, 'audio.%(ext)s'),
+                'quiet': True,
+                'no_warnings': True,
+                'postprocessors': [{
+                    'key': 'FFmpegExtractAudio',
+                    'preferredcodec': 'wav',
+                    'preferredquality': '192',
+                }],
+            }
+            
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([video_url])
+            
+            # Find the downloaded file
+            for file in os.listdir(temp_dir):
+                if file.endswith('.wav'):
+                    return os.path.join(temp_dir, file)
+            
+            raise FileNotFoundError("Audio file not found after download")
+        
+        # Run download in thread pool to avoid blocking
+        loop = asyncio.get_event_loop()
+        audio_file = await loop.run_in_executor(self.executor, download_sync)
+        
+        logger.info(f"Audio downloaded: {audio_file}")
+        return audio_file
+
+    async def _process_audio_chunks(
+        self, 
+        audio_file: str, 
+        chunk_duration_ms: int,
+        total_duration: float
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """Process audio file in chunks and send to Universal-Streaming"""
+        
+        def load_and_convert_audio():
+            # Load audio using soundfile (better Python 3.13 compatibility)
+            try:
+                audio_data, sample_rate = sf.read(audio_file)
+                
+                # Convert to mono if stereo
+                if len(audio_data.shape) > 1:
+                    audio_data = np.mean(audio_data, axis=1)
+                
+                # Resample to 16kHz if needed
+                if sample_rate != 16000:
+                    from scipy import signal
+                    num_samples = int(len(audio_data) * 16000 / sample_rate)
+                    audio_data = signal.resample(audio_data, num_samples)
+                    sample_rate = 16000
+                
+                # Convert to AudioSegment for chunking
+                # Scale to 16-bit integer range
+                audio_data_int = (audio_data * 32767).astype(np.int16)
+                audio_segment = AudioSegment(
+                    audio_data_int.tobytes(),
+                    frame_rate=16000,
+                    sample_width=2,
+                    channels=1
+                )
+                
+                return audio_segment
+            except Exception as e:
+                logger.error(f"Error loading audio with soundfile: {e}")
+                # Fallback to pydub
+                audio = AudioSegment.from_file(audio_file)
+                return audio.set_frame_rate(16000).set_channels(1).set_sample_width(2)
+        
+        # Load audio in thread pool
+        loop = asyncio.get_event_loop()
+        audio = await loop.run_in_executor(self.executor, load_and_convert_audio)
+        
+        total_chunks = len(audio) // chunk_duration_ms
+        logger.info(f"Processing {total_chunks} audio chunks of {chunk_duration_ms}ms each")
+        
+        # Process chunks
+        for i in range(0, len(audio), chunk_duration_ms):
+            chunk = audio[i:i + chunk_duration_ms]
+            
+            if len(chunk) < 50:  # Skip very short chunks
+                continue
+            
+            # Convert chunk to bytes (PCM16)
+            chunk_bytes = chunk.raw_data
+            
+            # Send to Universal-Streaming
+            await self._send_audio_chunk(chunk_bytes)
+            
+            # Calculate progress
+            timestamp = i / 1000.0
+            duration_processed = min(i + chunk_duration_ms, len(audio)) / 1000.0
+            
+            progress = StreamProgress(
+                chunk_id=i // chunk_duration_ms,
+                timestamp=timestamp,
+                duration_processed=duration_processed,
+                total_duration=total_duration,
+                status="processing"
+            )
+            
+            yield {
+                "type": "progress",
+                "chunk_id": progress.chunk_id,
+                "timestamp": progress.timestamp,
+                "duration_processed": progress.duration_processed,
+                "total_duration": progress.total_duration,
+                "progress_percent": (duration_processed / total_duration * 100) if total_duration > 0 else 0
+            }
+            
+            # Small delay to prevent overwhelming the API
+            await asyncio.sleep(0.05)
+        
+        # Signal end of audio stream
+        await self._end_transcription_session()
+        
+        yield {
+            "type": "audio_complete",
+            "total_chunks_sent": total_chunks,
+            "status": "waiting_for_final_transcripts"
+        }
+
+    async def _send_audio_chunk(self, audio_chunk: bytes) -> None:
+        """Send audio chunk to Universal-Streaming WebSocket"""
+        if not self.websocket or not self.session_active:
+            raise Exception("WebSocket not connected")
+        
+        try:
+            # Universal-Streaming expects raw audio data, not base64
+            # Send as binary message
+            await self.websocket.send(audio_chunk)
+            
+        except Exception as e:
+            logger.error(f"Error sending audio chunk: {e}")
+            raise
+
+    async def _end_transcription_session(self) -> None:
+        """Signal end of transcription session"""
+        if self.websocket and self.session_active:
+            try:
+                end_message = {"type": "session_end"}
+                await self.websocket.send(json.dumps(end_message))
+                self.session_active = False
+                logger.info("Universal-Streaming session ended")
+            except Exception as e:
+                logger.error(f"Error ending session: {e}")
+
+    async def get_message(self) -> Optional[Dict[str, Any]]:
+        """Get next message from the transcript queue"""
+        try:
+            return await asyncio.wait_for(self._message_queue.get(), timeout=0.1)
+        except asyncio.TimeoutError:
+            return None
+
+    async def stream_transcription(
+        self,
+        video_url: str,
+        chunk_duration_ms: int = 200,
+        enable_formatting: bool = True,
+        sample_rate: int = 16000
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """Main streaming transcription pipeline using Universal-Streaming"""
+        try:
+            # Connect to Universal-Streaming WebSocket
+            await self.connect_websocket(
+                sample_rate=sample_rate,
+                enable_formatting=enable_formatting
+            )
+            
+            yield {
+                "type": "connection_established",
+                "status": "connected_to_universal_streaming"
+            }
+            
+            # Start transcript message streaming
+            transcript_task = asyncio.create_task(self._stream_transcript_messages())
+            
+            # Process video and stream audio chunks
+            async for video_result in self.download_and_process_video(video_url, chunk_duration_ms):
+                yield video_result
+                
+                # Check for any transcript messages
+                try:
+                    while True:
+                        message = await asyncio.wait_for(self._message_queue.get(), timeout=0.01)
+                        if message:
+                            if message["type"] == "transcript":
+                                chunk = message["data"]
+                                yield {
+                                    "type": "transcript",
+                                    "text": chunk.text,
+                                    "confidence": chunk.confidence,
+                                    "end_of_turn": chunk.end_of_turn,
+                                    "turn_order": chunk.turn_order,
+                                    "is_formatted": chunk.is_formatted
+                                }
+                            elif message["type"] in ["session_started", "session_ended"]:
+                                yield {"type": message["type"], "message": message["data"]}
+                            elif message["type"] == "error":
+                                yield {"type": "error", "message": message["data"]}
+                except asyncio.TimeoutError:
+                    pass  # No transcript messages available, continue
+            
+            # Wait a bit for final transcripts
+            await asyncio.sleep(2)
+            
+            # Get any remaining transcript messages
+            final_transcripts = []
+            try:
+                while True:
+                    message = await asyncio.wait_for(self._message_queue.get(), timeout=0.1)
+                    if message and message["type"] == "transcript":
+                        chunk = message["data"]
+                        final_transcripts.append(chunk.text)
+                        yield {
+                            "type": "transcript",
+                            "text": chunk.text,
+                            "confidence": chunk.confidence,
+                            "end_of_turn": chunk.end_of_turn,
+                            "turn_order": chunk.turn_order,
+                            "is_formatted": chunk.is_formatted
+                        }
+            except asyncio.TimeoutError:
+                pass
+            
+            # Final summary
+            all_transcript_text = " ".join([chunk.text for chunk in self.transcript_chunks])
+            yield {
+                "type": "complete",
+                "total_transcripts": len(self.transcript_chunks),
+                "final_text": all_transcript_text
+            }
+            
+            # Cancel transcript task
+            transcript_task.cancel()
+            
+        except Exception as e:
+            logger.error(f"Streaming transcription error: {e}")
+            yield {"type": "error", "message": str(e)}
+        finally:
+            if self.websocket:
+                await self.websocket.close()
+
+    async def _stream_transcript_messages(self):
+        """Background task to stream transcript messages"""
+        while self.session_active:
+            try:
+                message = await asyncio.wait_for(self._message_queue.get(), timeout=1.0)
+                if message:
+                    # Messages are handled in the main stream_transcription method
+                    # This is just to keep the queue processing
+                    await self._message_queue.put(message)  # Put it back
+            except asyncio.TimeoutError:
+                continue
+            except Exception as e:
+                logger.error(f"Error in transcript message streaming: {e}")
+                break
+
+
+# FastAPI Application
+app = FastAPI(title="Universal-Streaming Transcription Service", version="3.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -40,623 +604,124 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Performance-focused configuration
-CHUNK_THRESHOLD_MINUTES = 5   # Lowered from 15 to test VAD chunking
-MAX_CONCURRENT_CHUNKS = 5     # Increased concurrency
-MIN_CHUNK_DURATION = 15       # Minimum chunk duration in seconds (lowered from 30)
-MAX_CHUNK_DURATION = 180      # Maximum chunk duration in seconds (lowered from 300)
-VAD_SAMPLE_RATE = 16000       # Silero VAD requires 16kHz
-
-class ChunkingRequest(BaseModel):
-    url: HttpUrl
-    max_concurrent: Optional[int] = MAX_CONCURRENT_CHUNKS
-    language_code: Optional[str] = "en_us"
-    use_vad_chunking: Optional[bool] = True
-    min_chunk_duration: Optional[int] = MIN_CHUNK_DURATION
-    max_chunk_duration: Optional[int] = MAX_CHUNK_DURATION
-    # New VAD parameters for fine control
-    min_pause_duration: Optional[float] = 1.0  # Minimum pause to consider for splitting (seconds)
-    force_split_interval: Optional[int] = 120  # Force split every N seconds if no natural pause
-
-class ChunkProgress(BaseModel):
-    chunk_id: int
-    status: str
-    start_time: float
-    end_time: float
-    text: Optional[str] = None
-    error: Optional[str] = None
-    processing_time: Optional[float] = None
-
-class TranscriptResponse(BaseModel):
-    text: str
-    status: str
-    video_title: str
-    total_duration: float
-    total_chunks: int
-    processing_time: float
-    service_method: str
-    chunks: List[Dict[str, Any]]
-
-# Global VAD model (loaded once)
-vad_model = None
-vad_utils = None
-
-def load_vad_model():
-    """Load Silero VAD model once at startup"""
-    global vad_model, vad_utils
-    if vad_model is None:
-        try:
-            logger.info("Loading Silero VAD model...")
-            vad_model, vad_utils = torch.hub.load(
-                repo_or_dir='snakers4/silero-vad',
-                model='silero_vad',
-                force_reload=False,
-                onnx=False
-            )
-            logger.info("VAD model loaded successfully")
-        except Exception as e:
-            logger.error(f"Failed to load VAD model: {e}")
-            raise
-
-# In-memory storage for job progress
-job_progress: Dict[str, Dict] = {}
-
-def extract_video_id(url: str) -> str:
-    """Extract video ID from YouTube URL"""
-    import re
-    patterns = [
-        r'(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/embed\/)([^&\n?#]+)',
-        r'youtube\.com\/v\/([^&\n?#]+)',
-        r'youtube\.com\/.*[?&]v=([^&\n?#]+)',
-    ]
-    
-    for pattern in patterns:
-        match = re.search(pattern, url)
-        if match:
-            return match.group(1)
-    
-    raise ValueError("Could not extract video ID from URL")
-
-def get_video_info_and_audio(url: str) -> tuple[str, str, float]:
-    """Download video info and extract audio file"""
-    try:
-        temp_dir = tempfile.mkdtemp(prefix="yt_audio_")
-        safe_filename = f"audio_{uuid.uuid4().hex[:8]}"
-        
-        ydl_opts = {
-            'format': 'bestaudio[ext=mp3]/bestaudio/best',
-            'outtmpl': os.path.join(temp_dir, f'{safe_filename}.%(ext)s'),
-            'noplaylist': True,
-            'quiet': True,
-            'no_warnings': True,
-            'postprocessors': [{
-                'key': 'FFmpegExtractAudio',
-                'preferredcodec': 'wav',  # Changed to WAV for better VAD compatibility
-                'preferredquality': '192',
-            }],
-        }
-        
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            logger.info("Getting video info...")
-            info = ydl.extract_info(url, download=False)
-            title = info.get('title', 'YouTube Video')
-            duration = info.get('duration', 0)
-            
-            if duration > 10800:
-                raise ValueError("Video is too long (>3 hours). Please try a shorter video.")
-            
-            logger.info(f"Video: {title}, Duration: {duration}s")
-            
-            logger.info("Downloading and converting audio...")
-            ydl.download([url])
-            
-            audio_file = None
-            for file in os.listdir(temp_dir):
-                if file.startswith(safe_filename) and file.endswith('.wav'):
-                    audio_file = os.path.join(temp_dir, file)
-                    break
-            
-            if not audio_file:
-                for file in os.listdir(temp_dir):
-                    if any(file.endswith(ext) for ext in ['.wav', '.mp3', '.m4a', '.webm']):
-                        audio_file = os.path.join(temp_dir, file)
-                        if not audio_file.endswith('.wav'):
-                            import subprocess
-                            wav_file = audio_file.replace(os.path.splitext(audio_file)[1], '.wav')
-                            subprocess.run([
-                                'ffmpeg', '-i', audio_file, '-acodec', 'pcm_s16le', '-ar', '16000', wav_file
-                            ], check=True, capture_output=True)
-                            os.remove(audio_file)
-                            audio_file = wav_file
-                        break
-            
-            if not audio_file or not os.path.exists(audio_file):
-                files_in_temp = os.listdir(temp_dir) if os.path.exists(temp_dir) else []
-                raise FileNotFoundError(f"Audio file not found. Files in temp dir: {files_in_temp}")
-            
-            if os.path.getsize(audio_file) == 0:
-                raise ValueError("Downloaded audio file is empty")
-            
-            logger.info(f"Audio file ready: {audio_file} ({os.path.getsize(audio_file)} bytes)")
-            return title, audio_file, duration
-            
-    except Exception as e:
-        logger.error(f"Error extracting audio: {e}")
-        if 'temp_dir' in locals() and os.path.exists(temp_dir):
-            try:
-                shutil.rmtree(temp_dir)
-            except:
-                pass
-        raise HTTPException(status_code=400, detail=f"Failed to extract audio: {str(e)}")
-
-class VADChunkingService:
-    def __init__(self):
-        self.executor = ThreadPoolExecutor(max_workers=MAX_CONCURRENT_CHUNKS)
-        # Load VAD model on initialization
-        load_vad_model()
-    
-    def should_use_chunking(self, duration_seconds: float) -> bool:
-        """Determine if chunking is beneficial for this video length"""
-        return duration_seconds > (CHUNK_THRESHOLD_MINUTES * 60)
-    
-    def detect_voice_segments(self, audio_file: str, min_duration: int, max_duration: int, min_pause: float = 1.0) -> List[Tuple[float, float]]:
-        """
-        Use Silero VAD to detect voice segments in audio file
-        Returns list of (start_time, end_time) tuples in seconds
-        """
-        try:
-            logger.info("Running VAD analysis...")
-            
-            # Try multiple backends for torchaudio compatibility
-            try:
-                # First try with soundfile backend
-                import soundfile
-                wav, original_sr = torchaudio.load(audio_file, backend="soundfile")
-            except:
-                try:
-                    # Fallback to ffmpeg backend
-                    wav, original_sr = torchaudio.load(audio_file, backend="ffmpeg")
-                except:
-                    # Final fallback - use pydub to convert then load
-                    logger.info("Using pydub fallback for audio loading")
-                    audio_segment = AudioSegment.from_file(audio_file)
-                    # Convert to wav in memory
-                    wav_io = io.BytesIO()
-                    audio_segment.export(wav_io, format="wav")
-                    wav_io.seek(0)
-                    wav, original_sr = torchaudio.load(wav_io, backend="soundfile")
-            
-            logger.info(f"Loaded audio: {wav.shape}, sample rate: {original_sr}")
-            
-            # Resample to 16kHz if necessary
-            if original_sr != VAD_SAMPLE_RATE:
-                resampler = torchaudio.transforms.Resample(original_sr, VAD_SAMPLE_RATE)
-                wav = resampler(wav)
-            
-            # Convert to mono if stereo
-            if wav.shape[0] > 1:
-                wav = torch.mean(wav, dim=0, keepdim=True)
-            
-            # Squeeze to 1D
-            wav = wav.squeeze()
-            
-            # Get speech timestamps using VAD
-            speech_timestamps = vad_utils[0](wav, vad_model, sampling_rate=VAD_SAMPLE_RATE)
-            
-            logger.info(f"VAD found {len(speech_timestamps)} raw speech segments")
-            
-            if not speech_timestamps:
-                logger.warning("No speech detected in audio")
-                # Return single segment covering whole audio as fallback
-                audio_duration = len(wav) / VAD_SAMPLE_RATE
-                return [(0.0, audio_duration)]
-            
-            # Convert VAD timestamps to seconds and merge nearby segments
-            segments = []
-            for timestamp in speech_timestamps:
-                start = timestamp['start'] / VAD_SAMPLE_RATE
-                end = timestamp['end'] / VAD_SAMPLE_RATE
-                segments.append((start, end))
-            
-            logger.info(f"Raw segments before merging: {len(segments)}")
-            for i, (start, end) in enumerate(segments[:5]):  # Show first 5
-                logger.info(f"Raw segment {i}: {start:.1f}s - {end:.1f}s")
-            
-            # Merge segments that are close together and enforce duration limits
-            merged_segments = self._merge_segments(segments, min_duration, max_duration, min_pause)
-            
-            logger.info(f"VAD detected {len(merged_segments)} speech segments after merging")
-            for i, (start, end) in enumerate(merged_segments):
-                logger.info(f"Final segment {i}: {start:.1f}s - {end:.1f}s (duration: {end-start:.1f}s)")
-            
-            return merged_segments
-            
-        except Exception as e:
-            logger.error(f"VAD analysis failed: {e}")
-            logger.error(f"Error details: {str(e)}")
-            # Fallback to single segment
-            audio = AudioSegment.from_file(audio_file)
-            duration = len(audio) / 1000.0
-            logger.info("Falling back to single segment processing")
-            return [(0.0, duration)]
-    
-    def _merge_segments(self, segments: List[Tuple[float, float]], min_duration: int, max_duration: int, min_pause: float = 1.0) -> List[Tuple[float, float]]:
-        """
-        Merge speech segments to create optimal chunks for transcription with custom pause detection
-        """
-        if not segments:
-            return []
-        
-        logger.info(f"Merging segments with min_duration={min_duration}s, max_duration={max_duration}s, min_pause={min_pause}s")
-        
-        merged = []
-        current_start, current_end = segments[0]
-        
-        for start, end in segments[1:]:
-            gap = start - current_end
-            new_duration = end - current_start
-            
-            logger.debug(f"Considering merge: gap={gap:.1f}s, new_duration={new_duration:.1f}s")
-            
-            # Only merge if gap is smaller than min_pause threshold AND won't exceed max duration
-            if gap < min_pause and new_duration <= max_duration:
-                logger.debug(f"Merging segments: extending to {end:.1f}s")
-                current_end = end
-            else:
-                # Split here - either natural pause found or duration limit reached
-                segment_duration = current_end - current_start
-                logger.info(f"Splitting at gap={gap:.1f}s: {current_start:.1f}s - {current_end:.1f}s (duration: {segment_duration:.1f}s)")
-                
-                merged.append((current_start, current_end))
-                current_start, current_end = start, end
-        
-        # Add final segment
-        merged.append((current_start, current_end))
-        logger.info(f"Added final segment: {current_start:.1f}s - {current_end:.1f}s")
-        
-        # Apply forced splitting if segments are still too long
-        merged = self._apply_forced_splitting(merged, max_duration, min_pause)
-        
-        logger.info(f"Final merged segments: {len(merged)}")
-        return merged
-    
-    def _apply_forced_splitting(self, segments: List[Tuple[float, float]], max_duration: int, min_pause: float) -> List[Tuple[float, float]]:
-        """
-        Apply forced splitting to segments that are still too long, finding the best pause within intervals
-        """
-        final_segments = []
-        
-        for start, end in segments:
-            duration = end - start
-            if duration <= max_duration:
-                final_segments.append((start, end))
-                continue
-            
-            logger.info(f"Applying forced splitting to segment {start:.1f}s - {end:.1f}s (duration: {duration:.1f}s)")
-            
-            # Split long segment into smaller chunks at natural pauses if possible
-            current_start = start
-            
-            while current_start < end:
-                target_end = min(current_start + max_duration, end)
-                
-                # If this would be the final small chunk, just extend to the end
-                min_duration_threshold = 30  # Don't create tiny trailing chunks
-                if end - target_end < min_duration_threshold:
-                    target_end = end
-                
-                final_segments.append((current_start, target_end))
-                logger.info(f"Forced split chunk: {current_start:.1f}s - {target_end:.1f}s")
-                
-                current_start = target_end
-        
-        return final_segments
-    
-    def create_vad_chunks(self, audio_file: str, min_duration: int, max_duration: int, min_pause: float = 1.0) -> List[Tuple[bytes, float, float]]:
-        """
-        Create audio chunks based on VAD speech segments with custom pause detection
-        """
-        start_time = time.time()
-        
-        try:
-            # Get speech segments using VAD with custom parameters
-            segments = self.detect_voice_segments(audio_file, min_duration, max_duration, min_pause)
-            
-            # Load audio once
-            audio = AudioSegment.from_file(audio_file)
-            
-            chunks = []
-            for i, (start_sec, end_sec) in enumerate(segments):
-                # Extract audio segment
-                start_ms = int(start_sec * 1000)
-                end_ms = int(end_sec * 1000)
-                chunk_audio = audio[start_ms:end_ms]
-                
-                # Export to bytes buffer
-                buffer = io.BytesIO()
-                chunk_audio.export(buffer, format="wav")
-                chunk_bytes = buffer.getvalue()
-                
-                chunks.append((chunk_bytes, start_sec, end_sec))
-                
-                logger.info(f"Created VAD chunk {i}: {start_sec:.1f}s - {end_sec:.1f}s ({len(chunk_bytes)} bytes)")
-            
-            processing_time = time.time() - start_time
-            logger.info(f"Created {len(chunks)} VAD chunks in {processing_time:.2f}s")
-            
-            return chunks
-            
-        except Exception as e:
-            logger.error(f"Error creating VAD chunks: {e}")
-            raise
-    
-    async def transcribe_chunk_from_memory(self, chunk_data: bytes, chunk_id: int, 
-                                         start_time: float, end_time: float) -> dict:
-        """Transcribe chunk directly from memory"""
-        chunk_start = time.time()
-        
-        try:
-            logger.info(f"Transcribing VAD chunk {chunk_id} ({start_time:.1f}s - {end_time:.1f}s)")
-            
-            # Create transcriber
-            transcriber = aai.Transcriber()
-            
-            # Upload chunk bytes directly
-            upload_url = await asyncio.get_event_loop().run_in_executor(
-                self.executor, 
-                lambda: transcriber.upload_file(chunk_data)
-            )
-            
-            # Transcribe
-            transcript = await asyncio.get_event_loop().run_in_executor(
-                self.executor,
-                lambda: transcriber.transcribe(upload_url)
-            )
-            
-            processing_time = time.time() - chunk_start
-            
-            if transcript.status == aai.TranscriptStatus.error:
-                logger.error(f"VAD chunk {chunk_id} failed: {transcript.error}")
-                return {
-                    "chunk_id": chunk_id,
-                    "status": "error",
-                    "start_time": start_time,
-                    "end_time": end_time,
-                    "error": transcript.error,
-                    "processing_time": processing_time
-                }
-            
-            logger.info(f"VAD chunk {chunk_id} completed in {processing_time:.2f}s")
-            return {
-                "chunk_id": chunk_id,
-                "status": "completed",
-                "start_time": start_time,
-                "end_time": end_time,
-                "text": transcript.text,
-                "processing_time": processing_time
-            }
-            
-        except Exception as e:
-            processing_time = time.time() - chunk_start
-            logger.error(f"Error transcribing VAD chunk {chunk_id}: {e}")
-            return {
-                "chunk_id": chunk_id,
-                "status": "error",
-                "start_time": start_time,
-                "end_time": end_time,
-                "error": str(e),
-                "processing_time": processing_time
-            }
-
-    async def process_single_video(self, audio_file: str, title: str, duration: float) -> dict:
-        """Process short video without chunking"""
-        logger.info(f"Processing {title} as single unit (duration: {duration:.1f}s)")
-        
-        start_time = time.time()
-        transcriber = aai.Transcriber()
-        
-        # Upload and transcribe in one go
-        transcript = await asyncio.get_event_loop().run_in_executor(
-            self.executor,
-            lambda: transcriber.transcribe(audio_file)
-        )
-        
-        processing_time = time.time() - start_time
-        
-        if transcript.status == aai.TranscriptStatus.error:
-            raise HTTPException(status_code=500, detail=f"Transcription failed: {transcript.error}")
-        
-        return {
-            "text": transcript.text,
-            "status": "completed",
-            "video_title": title,
-            "audio_duration": duration,
-            "total_duration": duration,
-            "total_chunks": 1,
-            "processing_time": processing_time,
-            "service_method": "single_unit",
-            "chunks": [{
-                "chunk_id": 0,
-                "status": "completed",
-                "start_time": 0.0,
-                "end_time": duration,
-                "processing_time": processing_time
-            }]
-        }
-
 @app.get("/")
 async def root():
-    return {"message": "Optimized AssemblyAI VAD Chunking Service", "version": "2.0.0"}
+    return {
+        "message": "Universal-Streaming Transcription Service", 
+        "version": "3.0.0",
+        "api": "AssemblyAI Universal-Streaming (v3)",
+        "features": ["streaming_download", "universal_streaming", "websocket_api"]
+    }
 
 @app.get("/health")
 async def health():
-    return {"status": "healthy", "vad_loaded": vad_model is not None}
-
-@app.get("/test")
-async def test():
-    """Test endpoint to verify service is working"""
     api_key = os.getenv('ASSEMBLYAI_API_KEY')
     return {
-        "status": "working",
-        "assemblyai_configured": bool(api_key),
-        "api_key_length": len(api_key) if api_key else 0,
-        "vad_model_loaded": vad_model is not None
+        "status": "healthy",
+        "assemblyai_configured": bool(api_key and api_key != "your_assemblyai_api_key_here"),
+        "streaming_enabled": True,
+        "api_version": "v3_universal_streaming"
     }
 
-@app.post("/transcribe-chunked")
-async def transcribe_optimized(request: ChunkingRequest):
-    """Optimized transcription with VAD-based chunking"""
-    job_id = str(uuid.uuid4())
-    start_time = time.time()
+@app.websocket("/stream-transcribe")
+async def websocket_transcribe(websocket: WebSocket):
+    """WebSocket endpoint for Universal-Streaming transcription"""
+    await websocket.accept()
     
     try:
-        logger.info(f"Starting VAD-optimized transcription for job {job_id}: {request.url}")
+        # Get parameters
+        data = await websocket.receive_json()
+        video_url = data.get("video_url")
         
-        # Check API key
+        if not video_url:
+            await websocket.send_json({
+                "type": "error", 
+                "message": "video_url is required"
+            })
+            return
+        
+        # Get API key from environment
         api_key = os.getenv('ASSEMBLYAI_API_KEY')
-        if not api_key:
-            raise HTTPException(status_code=500, detail="AssemblyAI API key not configured")
+        if not api_key or api_key == "your_assemblyai_api_key_here":
+            await websocket.send_json({
+                "type": "error", 
+                "message": "AssemblyAI API key not configured properly"
+            })
+            return
         
-        aai.settings.api_key = api_key
+        # Optional parameters
+        chunk_duration = data.get("chunk_duration_ms", 200)
+        enable_formatting = data.get("enable_formatting", True)
+        sample_rate = data.get("sample_rate", 16000)
         
-        # Initialize service
-        service = VADChunkingService()
+        # Initialize pipeline
+        pipeline = UniversalStreamingPipeline(api_key)
         
-        # Download video and extract audio
-        video_title, audio_file, duration = get_video_info_and_audio(str(request.url))
-        download_time = time.time() - start_time
-        
-        logger.info(f"Video downloaded in {download_time:.2f}s: {video_title} ({duration:.1f}s)")
-        
-        # Decide processing strategy
-        if not service.should_use_chunking(duration) or not request.use_vad_chunking:
-            logger.info("Short video or VAD disabled - processing without chunking")
-            result = await service.process_single_video(audio_file, video_title, duration)
-            result["download_time"] = download_time
+        # Stream transcription results
+        async for result in pipeline.stream_transcription(
+            video_url,
+            chunk_duration_ms=chunk_duration,
+            enable_formatting=enable_formatting,
+            sample_rate=sample_rate
+        ):
+            await websocket.send_json(result)
             
-            # Cleanup
-            try:
-                if os.path.exists(audio_file):
-                    audio_dir = os.path.dirname(audio_file)
-                    shutil.rmtree(audio_dir)
-            except:
-                pass
-            
-            return result
-        
-        # Use VAD chunking for long videos
-        logger.info("Long video detected - using VAD-based chunking")
-        
-        chunk_creation_start = time.time()
-        chunks = service.create_vad_chunks(
-            audio_file, 
-            request.min_chunk_duration or MIN_CHUNK_DURATION,
-            request.max_chunk_duration or MAX_CHUNK_DURATION,
-            request.min_pause_duration or 1.0
-        )
-        chunk_creation_time = time.time() - chunk_creation_start
-        
-        # Process chunks with concurrency
-        semaphore = asyncio.Semaphore(request.max_concurrent or MAX_CONCURRENT_CHUNKS)
-        
-        async def process_chunk_with_semaphore(chunk_data):
-            async with semaphore:
-                chunk_bytes, start_t, end_t = chunk_data
-                chunk_id = chunks.index(chunk_data)
-                return await service.transcribe_chunk_from_memory(
-                    chunk_bytes, chunk_id, start_t, end_t
-                )
-        
-        transcription_start = time.time()
-        chunk_results = await asyncio.gather(
-            *[process_chunk_with_semaphore(chunk_data) for chunk_data in chunks],
-            return_exceptions=True
-        )
-        transcription_time = time.time() - transcription_start
-        
-        # Process results
-        processed_results = []
-        for i, result in enumerate(chunk_results):
-            if isinstance(result, Exception):
-                logger.error(f"VAD chunk {i} failed: {result}")
-                processed_results.append({
-                    "chunk_id": i,
-                    "status": "error",
-                    "start_time": chunks[i][1],
-                    "end_time": chunks[i][2],
-                    "error": str(result)
-                })
-            else:
-                processed_results.append(result)
-        
-        # Merge transcripts in chronological order
-        merge_start = time.time()
-        successful_chunks = [r for r in processed_results if r["status"] == "completed"]
-        successful_chunks.sort(key=lambda x: x["start_time"])
-        
-        merged_text = " ".join([chunk["text"] for chunk in successful_chunks if chunk.get("text")])
-        merge_time = time.time() - merge_start
-        
-        total_processing_time = time.time() - start_time
-        
-        # Cleanup
-        try:
-            if os.path.exists(audio_file):
-                audio_dir = os.path.dirname(audio_file)
-                shutil.rmtree(audio_dir)
-        except:
-            pass
-        
-        logger.info(f"VAD chunked processing completed in {total_processing_time:.2f}s")
-        logger.info(f"Timing breakdown - Download: {download_time:.2f}s, "
-                   f"VAD+Chunks: {chunk_creation_time:.2f}s, "
-                   f"Transcription: {transcription_time:.2f}s, "
-                   f"Merge: {merge_time:.2f}s")
-        
-        return {
-            "text": merged_text,
-            "status": "completed",
-            "video_title": video_title,
-            "audio_duration": duration,
-            "total_duration": duration,
-            "total_chunks": len(chunks),
-            "processing_time": total_processing_time,
-            "service_method": "vad_chunking",
-            "timing_breakdown": {
-                "download": download_time,
-                "vad_chunk_creation": chunk_creation_time,
-                "transcription": transcription_time,
-                "merge": merge_time
-            },
-            "chunks": processed_results
-        }
-        
-    except HTTPException:
-        raise
     except Exception as e:
-        logger.error(f"Job {job_id} failed with error: {e}")
-        logger.error(f"Error type: {type(e)}")
-        import traceback
-        logger.error(f"Full traceback: {traceback.format_exc()}")
-        
-        # Return a more detailed error response
-        raise HTTPException(
-            status_code=500, 
-            detail=f"Transcription failed: {str(e)} (Type: {type(e).__name__})"
-        )
+        logger.error(f"WebSocket error: {e}")
+        await websocket.send_json({
+            "type": "error", 
+            "message": f"Pipeline failed: {str(e)}"
+        })
+    finally:
+        await websocket.close()
 
-@app.get("/job/{job_id}")
-async def get_job_status(job_id: str):
-    """Get status of a transcription job"""
-    if job_id not in job_progress:
-        raise HTTPException(status_code=404, detail="Job not found")
+@app.post("/stream-transcribe")
+async def http_stream_transcribe(request: StreamingRequest):
+    """HTTP streaming endpoint for transcription"""
+    api_key = os.getenv('ASSEMBLYAI_API_KEY')
+    if not api_key or api_key == "your_assemblyai_api_key_here":
+        raise HTTPException(status_code=500, detail="AssemblyAI API key not configured")
     
-    return job_progress[job_id]
+    pipeline = UniversalStreamingPipeline(api_key)
+    
+    async def generate_stream():
+        try:
+            async for result in pipeline.stream_transcription(
+                str(request.url),
+                chunk_duration_ms=request.chunk_duration_ms,
+                enable_formatting=request.enable_formatting,
+                sample_rate=request.sample_rate
+            ):
+                yield f"data: {json.dumps(result)}\n\n"
+        except Exception as e:
+            yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+    
+    return StreamingResponse(
+        generate_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "Access-Control-Allow-Origin": "*",
+        }
+    )
 
 if __name__ == "__main__":
     import uvicorn
+    
+    # Check for API key
+    api_key = os.getenv('ASSEMBLYAI_API_KEY')
+    if not api_key or api_key == "your_assemblyai_api_key_here":
+        print("⚠️  WARNING: ASSEMBLYAI_API_KEY not properly configured in .env file")
+        print("Please edit .env and add your API key from https://www.assemblyai.com/app/account")
+    else:
+        print("✅ AssemblyAI API key configured")
+    
+    print("🚀 Starting Universal-Streaming Transcription Service")
+    print("📡 Using AssemblyAI Universal-Streaming (v3) API")
+    
     uvicorn.run(
-        "main:app", 
+        "main:app",
         host="0.0.0.0", 
         port=8002,
         reload=True,
